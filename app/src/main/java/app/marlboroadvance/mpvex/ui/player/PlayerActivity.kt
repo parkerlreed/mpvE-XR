@@ -48,8 +48,6 @@ import app.marlboroadvance.mpvex.ui.theme.MpvexTheme
 import app.marlboroadvance.mpvex.utils.history.RecentlyPlayedOps
 import app.marlboroadvance.mpvex.utils.media.HttpUtils
 import app.marlboroadvance.mpvex.utils.media.SubtitleOps
-import app.marlboroadvance.mpvex.utils.storage.FileTypeUtils
-import app.marlboroadvance.mpvex.utils.storage.FileFilterUtils
 import com.github.k1rakishou.fsaf.FileManager
 import `is`.xyz.mpv.MPVLib
 import `is`.xyz.mpv.MPVNode
@@ -148,6 +146,9 @@ class PlayerActivity :
    * Manager for file operations.
    */
   private val fileManager: FileManager by inject()
+
+  /** Playback history (resume, recently played, folder playlists), shared with the XR player. */
+  private val playbackHistory by lazy { PlaybackHistory(this) }
 
   /**
    * Track selector for automatic audio/subtitle selection
@@ -1282,19 +1283,7 @@ class PlayerActivity :
    * @param intent The intent containing the file URI
    * @return The display name of the file, or empty string if not found
    */
-  private fun getFileName(intent: Intent): String {
-    // First check if a custom title/filename was provided via intent extras
-    intent.getStringExtra("title")?.let { return it }
-    intent.getStringExtra("filename")?.let { return it }
-
-    val uri = extractUriFromIntent(intent) ?: return ""
-
-    // Try content resolver first for content:// URIs
-    getDisplayNameFromUri(uri)?.let { return it }
-
-    // Extract filename from URL/URI
-    return extractFileNameFromUri(uri)
-  }
+  private fun getFileName(intent: Intent): String = playbackHistory.fileName(intent)
 
   /**
    * Extracts filename from URI, handling URL encoding and network URLs properly.
@@ -1303,41 +1292,7 @@ class PlayerActivity :
    * @param uri The URI to extract filename from
    * @return The extracted filename
    */
-  private fun extractFileNameFromUri(uri: Uri): String {
-    // For HTTP/HTTPS URLs, extract from path (will be updated async via HTTP headers)
-    if (HttpUtils.isNetworkStream(uri)) {
-      // Get the last path segment and decode URL encoding
-      val path = uri.path ?: return uri.host ?: "Network Stream"
-      val lastSegment = path.substringAfterLast("/")
-
-      if (lastSegment.isNotBlank()) {
-        // Decode URL encoding (e.g., %20 -> space)
-        return try {
-          java.net.URLDecoder.decode(lastSegment, "UTF-8")
-            .substringBefore("?") // Remove query parameters
-            .substringBefore("#") // Remove fragments (only for network streams)
-            .takeIf { it.isNotBlank() } ?: uri.host ?: "Network Stream"
-        } catch (e: Exception) {
-          lastSegment
-            .substringBefore("?")
-            .substringBefore("#")
-        }
-      }
-
-      // If no filename in path, use hostname
-      return uri.host ?: "Network Stream"
-    }
-
-    // For file:// and content:// URIs - preserve # characters as they're part of the filename
-    val lastSegment = uri.lastPathSegment?.substringAfterLast("/") ?: uri.path ?: "Unknown Video"
-    
-    // For local files, only decode URL encoding but preserve # characters
-    return try {
-      java.net.URLDecoder.decode(lastSegment, "UTF-8")
-    } catch (e: Exception) {
-      lastSegment
-    }
-  }
+  private fun extractFileNameFromUri(uri: Uri): String = playbackHistory.fileNameFromUriPath(uri)
 
   /**
    * Gets the display title for a playlist item URI.
@@ -1345,13 +1300,7 @@ class PlayerActivity :
    * @param uri The URI to get the title for
    * @return The display name/title of the file
    */
-  internal fun getPlaylistItemTitle(uri: Uri): String {
-    // Try content resolver first for content:// URIs
-    getDisplayNameFromUri(uri)?.let { return it }
-
-    // Extract filename from URL/URI
-    return extractFileNameFromUri(uri)
-  }
+  internal fun getPlaylistItemTitle(uri: Uri): String = playbackHistory.fileName(uri)
 
   /**
    * Plays a playlist item by index.
@@ -1370,17 +1319,7 @@ class PlayerActivity :
    * @param intent The intent to extract URI from
    * @return The extracted URI, or null if not found
    */
-  private fun extractUriFromIntent(intent: Intent): Uri? =
-    if (intent.type == "text/plain") {
-      intent.getStringExtra(Intent.EXTRA_TEXT)?.toUri()
-    } else {
-      intent.data ?: if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-        intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-      } else {
-        @Suppress("DEPRECATION")
-        intent.getParcelableExtra(Intent.EXTRA_STREAM)
-      }
-    }
+  private fun extractUriFromIntent(intent: Intent): Uri? = playbackHistory.uriFromIntent(intent)
 
   /**
    * Queries the content resolver to get the display name for a URI.
@@ -1388,21 +1327,7 @@ class PlayerActivity :
    * @param uri The URI to query
    * @return The display name, or null if not found
    */
-  private fun getDisplayNameFromUri(uri: Uri): String? =
-    runCatching {
-      contentResolver
-        .query(
-          uri,
-          arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
-          null,
-          null,
-          null,
-        )?.use { cursor ->
-          if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
-    }.onFailure { e ->
-      Log.e(TAG, "Error getting display name from URI", e)
-    }.getOrNull()
+  private fun getDisplayNameFromUri(uri: Uri): String? = playbackHistory.displayName(uri)
 
   /**
    * Converts the intent URI to a playable URI string for MPV.
@@ -2190,105 +2115,19 @@ class PlayerActivity :
    * Handles various URI schemes and infers launch source.
    */
   private suspend fun saveRecentlyPlayed() {
-    runCatching {
-      val uri = extractUriFromIntent(intent)
-
-      if (uri == null) {
-        Log.w(TAG, "Cannot save recently played: URI is null")
-        return@runCatching
-      }
-
-      if (uri.scheme == null) {
-        Log.w(TAG, "Cannot save recently played: URI has null scheme: $uri")
-        return@runCatching
-      }
-
-      val filePath =
-        when (uri.scheme) {
-          "file" -> {
-            uri.path ?: uri.toString()
-          }
-
-          "content" -> {
-            contentResolver
-              .query(
-                uri,
-                arrayOf(MediaStore.MediaColumns.DATA),
-                null,
-                null,
-                null,
-              )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                  val columnIndex = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                  if (columnIndex != -1) cursor.getString(columnIndex) else null
-                } else {
-                  null
-                }
-              } ?: uri.toString()
-          }
-
-          else -> {
-            uri.toString()
-          }
-        }
-
-      val launchSource =
-        when {
-          intent.getStringExtra("launch_source") != null -> intent.getStringExtra("launch_source")
-          intent.action == Intent.ACTION_SEND -> "share"
-          else -> "normal"
-        }
-
-      // Get parsed video title from MPV
-      val videoTitle = runCatching {
-        MPVLib.getPropertyString("media-title")
-      }.getOrNull()?.takeIf { it.isNotBlank() && it != fileName }
-
-      // Get duration and file size from MPV
-      val duration = runCatching {
-        (MPVLib.getPropertyDouble("duration") ?: 0.0).times(1000).toLong()
-      }.getOrDefault(0L)
-
-      val fileSize = runCatching {
-        // Try multiple properties to get file size
-        MPVLib.getPropertyDouble("file-size")?.toLong()
-          ?: MPVLib.getPropertyDouble("stream-end")?.toLong()
-          ?: 0L
-      }.getOrDefault(0L)
-
-      // Get video resolution from MPV
-      val width = runCatching {
-        MPVLib.getPropertyInt("width") ?: MPVLib.getPropertyInt("video-params/w") ?: 0
-      }.getOrDefault(0)
-
-      val height = runCatching {
-        MPVLib.getPropertyInt("height") ?: MPVLib.getPropertyInt("video-params/h") ?: 0
-      }.getOrDefault(0)
-
-      RecentlyPlayedOps.addRecentlyPlayed(
-        filePath = filePath,
-        fileName = fileName,
-        videoTitle = videoTitle,
-        duration = duration,
-        fileSize = fileSize,
-        width = width,
-        height = height,
-        launchSource = launchSource,
-      )
-
-      Log.d(TAG, "Saved recently played: $filePath")
-      Log.d(TAG, "  - fileName: $fileName")
-      Log.d(TAG, "  - videoTitle: $videoTitle")
-      Log.d(TAG, "  - duration: ${duration}ms")
-      Log.d(TAG, "  - size: ${fileSize}B")
-      Log.d(TAG, "  - resolution: ${width}x${height}")
-      Log.d(TAG, "  - source: $launchSource")
-    }.onFailure { e ->
-      Log.e(TAG, "Error saving recently played", e)
+    val uri = extractUriFromIntent(intent)
+    if (uri == null) {
+      Log.w(TAG, "Cannot save recently played: URI is null")
+      return
     }
+    val launchSource =
+      when {
+        intent.getStringExtra("launch_source") != null -> intent.getStringExtra("launch_source")
+        intent.action == Intent.ACTION_SEND -> "share"
+        else -> "normal"
+      }
+    playbackHistory.addRecentlyPlayed(uri, fileName, launchSource)
   }
-
-  // ==================== Intent and Result Management ====================
 
   /**
    * Sets the result intent with current playback position and duration.
@@ -3070,25 +2909,7 @@ class PlayerActivity :
     // Update playlist play history if this is a custom playlist
     playlistId?.let { id ->
       lifecycleScope.launch(Dispatchers.IO) {
-        val filePath = when (uri.scheme) {
-          "file" -> uri.path ?: uri.toString()
-          "content" -> {
-            contentResolver.query(
-              uri,
-              arrayOf(MediaStore.MediaColumns.DATA),
-              null,
-              null,
-              null,
-            )?.use { cursor ->
-              if (cursor.moveToFirst()) {
-                val columnIndex = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                if (columnIndex != -1) cursor.getString(columnIndex) else null
-              } else null
-            } ?: uri.toString()
-          }
-
-          else -> uri.toString()
-        }
+        val filePath = playbackHistory.historyPath(uri)
 
         runCatching {
           playlistRepository.updatePlayHistory(id, filePath)
@@ -3129,10 +2950,7 @@ class PlayerActivity :
   /**
    * Get file name from URI (used for playlist items)
    */
-  private fun getFileNameFromUri(uri: Uri): String {
-    getDisplayNameFromUri(uri)?.let { return it }
-    return extractFileNameFromUri(uri)
-  }
+  private fun getFileNameFromUri(uri: Uri): String = playbackHistory.fileName(uri)
 
   /**
    * Get the current video title for controls display.
@@ -3184,86 +3002,7 @@ class PlayerActivity :
   private suspend fun saveRecentlyPlayedForUri(
     uri: Uri,
     name: String,
-  ) {
-    runCatching {
-      val filePath =
-        when (uri.scheme) {
-          "file" -> {
-            uri.path ?: uri.toString()
-          }
-
-          "content" -> {
-            contentResolver
-              .query(
-                uri,
-                arrayOf(MediaStore.MediaColumns.DATA),
-                null,
-                null,
-                null,
-              )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                  val columnIndex = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                  if (columnIndex != -1) cursor.getString(columnIndex) else null
-                } else {
-                  null
-                }
-              } ?: uri.toString()
-          }
-
-          else -> {
-            uri.toString()
-          }
-        }
-
-      // Get parsed video title from MPV
-      val videoTitle = runCatching {
-        MPVLib.getPropertyString("media-title")
-      }.getOrNull()?.takeIf { it.isNotBlank() && it != name }
-
-      // Get duration and file size from MPV
-      val duration = runCatching {
-        (MPVLib.getPropertyDouble("duration") ?: 0.0).times(1000).toLong()
-      }.getOrDefault(0L)
-
-      val fileSize = runCatching {
-        // Try multiple properties to get file size
-        MPVLib.getPropertyDouble("file-size")?.toLong()
-          ?: MPVLib.getPropertyDouble("stream-end")?.toLong()
-          ?: 0L
-      }.getOrDefault(0L)
-
-      // Get video resolution from MPV
-      val width = runCatching {
-        MPVLib.getPropertyInt("width") ?: MPVLib.getPropertyInt("video-params/w") ?: 0
-      }.getOrDefault(0)
-
-      val height = runCatching {
-        MPVLib.getPropertyInt("height") ?: MPVLib.getPropertyInt("video-params/h") ?: 0
-      }.getOrDefault(0)
-
-      RecentlyPlayedOps.addRecentlyPlayed(
-        filePath = filePath,
-        fileName = name,
-        videoTitle = videoTitle,
-        duration = duration,
-        fileSize = fileSize,
-        width = width,
-        height = height,
-        launchSource = "playlist",
-        playlistId = playlistId,
-      )
-
-      Log.d(TAG, "Saved recently played (playlist): $filePath")
-      Log.d(TAG, "  - fileName: $name")
-      Log.d(TAG, "  - videoTitle: $videoTitle")
-      Log.d(TAG, "  - duration: ${duration}ms")
-      Log.d(TAG, "  - size: ${fileSize}B")
-      Log.d(TAG, "  - resolution: ${width}x${height}")
-      Log.d(TAG, "  - playlistId: $playlistId")
-    }.onFailure { e ->
-      Log.e(TAG, "Error saving recently played for playlist item", e)
-    }
-  }
+  ) = playbackHistory.addRecentlyPlayed(uri, name, launchSource = "playlist", playlistId = playlistId)
 
   /**
    * Generate a unique identifier for this media for playback state/history.
@@ -3274,34 +3013,8 @@ class PlayerActivity :
    * For network streams via proxy (SMB/WebDAV/FTP), uses the stable network file path from intent extras.
    * For other network URIs (http/https/rtmp/etc.), uses a hash of the URI string to distinguish different streams.
    */
-  private fun getMediaIdentifier(intent: Intent, fileName: String): String {
-    // Check if this is a network file played via proxy (SMB/WebDAV/FTP)
-    // Use the stable network file path instead of the temporary proxy URL
-    val networkFilePath = intent.getStringExtra("network_file_path")
-    val networkConnectionId = intent.getLongExtra("network_connection_id", -1L)
-
-    if (networkFilePath != null && networkConnectionId != -1L) {
-      // For network files via proxy: use connection ID + file path for stable identifier
-      val identifier = "network_${networkConnectionId}_${networkFilePath.hashCode()}"
-      Log.d(
-        TAG,
-        "Using network file identifier: $identifier (connection: $networkConnectionId, path: $networkFilePath)",
-      )
-      return identifier
-    }
-
-    val uri = extractUriFromIntent(intent)
-    return if (uri != null && (uri.scheme?.startsWith("http") == true || uri.scheme == "rtmp" || uri.scheme == "ftp" || uri.scheme == "rtsp" || uri.scheme == "mms")) {
-      // For remote protocols: hash the URI so position is per-episode or per-stream.
-      "${fileName}_${uri.toString().hashCode()}"
-    } else if (uri != null) {
-      // For local/file/content uris: include the full path so same-named files
-      // in different directories don't collide.
-      localMediaIdentifier(uri, fileName)
-    } else {
-      fileName
-    }
-  }
+  private fun getMediaIdentifier(intent: Intent, fileName: String): String =
+    playbackHistory.mediaIdentifier(intent, fileName)
 
   /**
    * Generate a unique identifier for this media from a URI and name.
@@ -3310,94 +3023,8 @@ class PlayerActivity :
    * path so that same-named files in different directories are distinct.
    * For network URIs (http/https/rtmp/etc.), uses a hash of the URI string to distinguish different streams.
    */
-  private fun getMediaIdentifierFromUri(uri: Uri, fileName: String): String {
-    return if (uri.scheme?.startsWith("http") == true || uri.scheme == "rtmp" || uri.scheme == "ftp" || uri.scheme == "rtsp" || uri.scheme == "mms") {
-      "${fileName}_${uri.toString().hashCode()}"
-    } else {
-      localMediaIdentifier(uri, fileName)
-    }
-  }
-
-  /**
-   * Builds a stable, directory-aware identifier for a local file URI.
-   *
-   * The identifier combines the display name with a hash of the file's full path
-   * so that two files with the same name in different folders resolve to
-   * different playback-history keys. The path is resolved to a value that stays
-   * stable across app launches (unlike a temporary file descriptor).
-   */
-  private fun localMediaIdentifier(uri: Uri, fileName: String): String {
-    val stablePath = resolveStableLocalPath(uri)
-    return if (stablePath.isNullOrBlank()) {
-      // Fallback: keep the previous filename-only behavior if we can't resolve a path.
-      fileName
-    } else {
-      // Delegate to the shared helper so deletion/rename cleanup keys match exactly.
-      app.marlboroadvance.mpvex.utils.media.MediaIdentifier.forLocalPath(stablePath)
-    }
-  }
-
-  /**
-   * Resolves a stable, persistent path string for a local file URI, including its
-   * directory. Returns null if no stable path can be determined.
-   *
-   * - file:// -> the URI path (already the full filesystem path)
-   * - content:// -> the real filesystem path via MediaStore DATA, falling back to
-   *   RELATIVE_PATH + DISPLAY_NAME, then the URI string itself.
-   *
-   * Note: [Uri.resolveUri] is intentionally NOT used here because it returns a
-   * temporary /proc/self/fd file descriptor for content URIs, which changes every
-   * session and would not be a stable key.
-   */
-  private fun resolveStableLocalPath(uri: Uri): String? = runCatching {
-    when (uri.scheme) {
-      "file" -> uri.path
-      "content" -> {
-        contentResolver.query(
-          uri,
-          arrayOf(MediaStore.MediaColumns.DATA),
-          null,
-          null,
-          null,
-        )?.use { cursor ->
-          if (cursor.moveToFirst()) {
-            val columnIndex = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-            if (columnIndex != -1) cursor.getString(columnIndex) else null
-          } else {
-            null
-          }
-        }?.takeIf { it.isNotBlank() } ?: resolveRelativeContentPath(uri) ?: uri.toString()
-      }
-
-      else -> uri.toString()
-    }
-  }.onFailure { e ->
-    Log.e(TAG, "Error resolving stable local path for $uri", e)
-  }.getOrNull()
-
-  /**
-   * Fallback for content URIs where MediaStore DATA is unavailable (e.g. on newer
-   * Android versions): builds a stable path from RELATIVE_PATH + DISPLAY_NAME.
-   */
-  private fun resolveRelativeContentPath(uri: Uri): String? = runCatching {
-    contentResolver.query(
-      uri,
-      arrayOf(MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.DISPLAY_NAME),
-      null,
-      null,
-      null,
-    )?.use { cursor ->
-      if (cursor.moveToFirst()) {
-        val relIdx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
-        val nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
-        val relative = if (relIdx != -1) cursor.getString(relIdx) else null
-        val name = if (nameIdx != -1) cursor.getString(nameIdx) else null
-        if (!relative.isNullOrBlank() && !name.isNullOrBlank()) "$relative$name" else null
-      } else {
-        null
-      }
-    }
-  }.getOrNull()
+  private fun getMediaIdentifierFromUri(uri: Uri, fileName: String): String =
+    playbackHistory.mediaIdentifier(uri, fileName)
 
   /**
    * Returns true only when the given URI points at a LOCAL file that no longer
@@ -3405,71 +3032,21 @@ class PlayerActivity :
    * and existing files all return false (we don't want false positives that
    * would block legitimate playback).
    */
-  private fun isLocalFileMissing(uri: Uri): Boolean {
-    // Never treat network streams as "missing".
-    if (uri.scheme?.startsWith("http") == true ||
-      uri.scheme == "rtmp" || uri.scheme == "rtsp" ||
-      uri.scheme == "mms" || uri.scheme == "ftp" || uri.scheme == "ftps"
-    ) {
-      return false
-    }
-
-    val path = when (uri.scheme) {
-      "file" -> uri.path
-      "content" -> resolveStableLocalPath(uri)?.takeIf { it.startsWith("/") }
-      else -> uri.path?.takeIf { it.startsWith("/") }
-    } ?: return false
-
-    return runCatching { !File(path).exists() }.getOrDefault(false)
-  }
+  private fun isLocalFileMissing(uri: Uri): Boolean = playbackHistory.isLocalFileMissing(uri)
 
   private fun generatePlaylistFromFolder(currentPath: String) {
     lifecycleScope.launch(Dispatchers.IO) {
       runCatching {
-        val currentFile = File(currentPath)
-        if (!currentFile.exists()) return@runCatching
-
-        val parentFolder = currentFile.parentFile ?: return@runCatching
-
-        val videoExtensions = FileTypeUtils.VIDEO_EXTENSIONS
-
-        val files = parentFolder.listFiles { file ->
-          file.isFile &&
-            FileTypeUtils.isVideoFile(file) &&
-            !FileFilterUtils.shouldSkipFile(file)
-        } ?: return@runCatching
-
         val launchSource = intent.getStringExtra("launch_source") ?: ""
-        val siblingFiles = if (launchSource == "video_list" || launchSource == "recently_played_button" || launchSource == "first_video_button") {
-          val videoSortType = browserPreferences.videoSortType.get()
-          val videoSortOrder = browserPreferences.videoSortOrder.get()
-          val bucketId = parentFolder.absolutePath.replace("\\", "/")
-          val videosInFolder =
-            app.marlboroadvance.mpvex.repository.MediaFileRepository.getVideosForBuckets(
-              context,
-              setOf(bucketId)
-            )
-          val sortedVideos = app.marlboroadvance.mpvex.utils.sort.SortUtils.sortVideos(videosInFolder, videoSortType, videoSortOrder)
-          sortedVideos.mapNotNull { video -> files.find { it.absolutePath == video.path } }
-        } else {
-          files.sortedWith { f1, f2 -> app.marlboroadvance.mpvex.utils.sort.SortUtils.NaturalOrderComparator.DEFAULT.compare(f1.name, f2.name) }
-        }
-
-        if (siblingFiles.size <= 1) return@runCatching
-
-        val newPlaylist = siblingFiles.map { it.toUri() }
-
-        val newIndex = siblingFiles.indexOfFirst { it.absolutePath == currentFile.absolutePath }
-
-        if (newIndex != -1) {
-          withContext(Dispatchers.Main) {
-            playlist = newPlaylist
-            playlistIndex = newIndex
-            Log.d(TAG, "Auto-playlist generated: ${playlist.size} videos")
-            // Re-initialize shuffle now that playlist is available
-            if (viewModel.shuffleEnabled.value) {
-              onShuffleToggled(true)
-            }
+        val (newPlaylist, newIndex) =
+          playbackHistory.folderPlaylist(currentPath, launchSource) ?: return@runCatching
+        withContext(Dispatchers.Main) {
+          playlist = newPlaylist
+          playlistIndex = newIndex
+          Log.d(TAG, "Auto-playlist generated: ${playlist.size} videos")
+          // Re-initialize shuffle now that playlist is available
+          if (viewModel.shuffleEnabled.value) {
+            onShuffleToggled(true)
           }
         }
       }.onFailure { e ->

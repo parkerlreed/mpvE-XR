@@ -13,6 +13,8 @@ headset switches to the immersive CRT player.
 - OpenXR (native C++/GLES), Meta passthrough, runs on the headset (no PC)
 - mpv renders straight onto the TV's curved glass, using all your usual mpv/mpvEx settings
 - Grab, push/pull, spin and resize the TV; its position is remembered between sessions
+- Resumes where you left off and plays on through folders and playlists, sharing watch history
+  with the regular player
 - Pressable buttons on the set, plus controller shortcuts
 - Hand tracking: pinch laser, or poke the buttons with your finger
 - Built-in TV/VCR combo, or drop in a realistic glTF model (see below)

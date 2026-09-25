@@ -14,18 +14,26 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
 import app.marlboroadvance.mpvex.R
+import app.marlboroadvance.mpvex.database.repository.PlaylistRepository
+import app.marlboroadvance.mpvex.preferences.AudioPreferences
 import app.marlboroadvance.mpvex.preferences.PlayerPreferences
 import app.marlboroadvance.mpvex.preferences.SubtitlesPreferences
 import app.marlboroadvance.mpvex.preferences.XrPreferences
 import app.marlboroadvance.mpvex.ui.player.MPVView
+import app.marlboroadvance.mpvex.ui.player.PlaybackHistory
 import app.marlboroadvance.mpvex.ui.player.PlayerActivity
+import app.marlboroadvance.mpvex.ui.player.TrackSelector
+import app.marlboroadvance.mpvex.ui.player.openContentFd
 import app.marlboroadvance.mpvex.ui.player.resolveUri
 import app.marlboroadvance.mpvex.utils.media.HttpUtils
 import app.marlboroadvance.mpvex.utils.media.SubtitleOps
 import `is`.xyz.mpv.MPVLib
 import `is`.xyz.mpv.MPVNode
 import `is`.xyz.mpv.Utils
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.koin.android.ext.android.inject
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
@@ -56,6 +64,20 @@ class XrPlayerActivity : ComponentActivity() {
   private val playerPreferences: PlayerPreferences by inject()
   private val xrPreferences: XrPreferences by inject()
   private val subtitlesPreferences: SubtitlesPreferences by inject()
+  private val audioPreferences: AudioPreferences by inject()
+  private val playlistRepository: PlaylistRepository by inject()
+  private val history by lazy { PlaybackHistory(this) }
+  private val trackSelector by lazy { TrackSelector(audioPreferences, subtitlesPreferences) }
+
+  // What's playing, for resume and history; moves along as the playlist advances.
+  private var fileName = ""
+  private var mediaIdentifier = ""
+  private var currentUri: Uri? = null
+  private var onPlaylistItem = false  // false while still on the file the intent opened
+  private var fileLoaded = false      // don't save over a file's state before it has loaded
+  private var playlist: List<Uri> = emptyList()
+  private var playlistIndex = 0
+  private var playlistId: Int? = null
 
   private lateinit var player: MPVView
   private var mpvInitialized = false
@@ -80,6 +102,12 @@ class XrPlayerActivity : ComponentActivity() {
       finish()
       return
     }
+    // Same guard as PlayerActivity: a local file deleted since it was listed.
+    if (history.uriFromIntent(intent)?.let(history::isLocalFileMissing) == true) {
+      Toast.makeText(this, R.string.toast_file_no_longer_exists, Toast.LENGTH_SHORT).show()
+      finish()
+      return
+    }
 
     runCatching { Utils.copyAssets(this) }
       .onFailure { Log.e(TAG, "Error copying mpv assets", it) }
@@ -88,6 +116,7 @@ class XrPlayerActivity : ComponentActivity() {
     mpvInitialized = true
     MPVLib.addObserver(observer)
     applyHttpHeaders(intent)
+    setUpFromIntent(intent)
     pendingPath = path
 
     renderThread = thread(name = "mpvEx-XR") {
@@ -100,14 +129,19 @@ class XrPlayerActivity : ComponentActivity() {
 
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
-    setIntent(intent)
     val path = playablePath(intent) ?: return
+    saveState()
+    setIntent(intent)
     applyHttpHeaders(intent)
+    setUpFromIntent(intent)
     MPVLib.command("loadfile", path)
   }
 
   override fun onStop() {
-    if (mpvInitialized) MPVLib.setPropertyBoolean("pause", true)
+    if (mpvInitialized) {
+      MPVLib.setPropertyBoolean("pause", true)
+      saveState()
+    }
     super.onStop()
   }
 
@@ -115,8 +149,105 @@ class XrPlayerActivity : ComponentActivity() {
     XrNative.requestExit()
     renderThread?.join(RENDER_THREAD_JOIN_MS)
     renderThread = null
+    // Must finish before mpv goes away, and lifecycleScope is already cancelled here.
+    saveState(blocking = true)
     destroyMpv()
     super.onDestroy()
+  }
+
+  /** Name, history key and playlist for the file an intent opens. */
+  private fun setUpFromIntent(intent: Intent) {
+    currentUri = history.uriFromIntent(intent)
+    fileName = history.fileName(intent).ifBlank { intent.data?.lastPathSegment ?: "Unknown Video" }
+    mediaIdentifier = history.mediaIdentifier(intent, fileName)
+    onPlaylistItem = false
+    fileLoaded = false
+
+    playlistId = intent.getIntExtra("playlist_id", -1).takeIf { it != -1 }
+    playlistIndex = intent.getIntExtra("playlist_index", 0)
+    playlist = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      intent.getParcelableArrayListExtra("playlist", Uri::class.java) ?: emptyList()
+    } else {
+      @Suppress("DEPRECATION")
+      intent.getParcelableArrayListExtra("playlist") ?: emptyList()
+    }
+    // Same sources as PlayerActivity: a saved playlist, or the file's folder in playlist mode.
+    val id = playlistId
+    if (playlist.isEmpty() && id != null) {
+      lifecycleScope.launch(Dispatchers.IO) {
+        val items = runCatching { playlistRepository.getPlaylistItemsAsUris(id) }.getOrDefault(emptyList())
+        withContext(Dispatchers.Main) { playlist = items }
+      }
+    } else if (playlist.isEmpty() && playerPreferences.playlistMode.get()) {
+      val path = playablePath(intent) ?: return
+      val launchSource = intent.getStringExtra("launch_source") ?: ""
+      lifecycleScope.launch(Dispatchers.IO) {
+        val folder = runCatching { history.folderPlaylist(path, launchSource) }.getOrNull() ?: return@launch
+        withContext(Dispatchers.Main) {
+          playlist = folder.first
+          playlistIndex = folder.second
+        }
+      }
+    }
+  }
+
+  /** Saves position, tracks, delays and speed for the current file, like the phone player. */
+  private fun saveState(blocking: Boolean = false) {
+    if (!mpvInitialized || !fileLoaded || mediaIdentifier.isBlank()) return
+    val snapshot = runCatching { history.snapshot() }.getOrNull() ?: return
+    val identifier = mediaIdentifier
+    if (blocking) {
+      runBlocking(Dispatchers.IO) { history.save(identifier, snapshot) }
+    } else {
+      lifecycleScope.launch(Dispatchers.IO) { history.save(identifier, snapshot) }
+    }
+  }
+
+  /** Autoplay through the playlist, or close at the end, following the player settings. */
+  private fun onEndOfFile() {
+    val next = playlistIndex + 1
+    if (playlist.isNotEmpty() && next < playlist.size && playerPreferences.autoplayNextVideo.get()) {
+      playItem(next)
+    } else if (playerPreferences.closeAfterReachingEndOfVideo.get()) {
+      finish()
+    } else {
+      saveState()
+    }
+  }
+
+  private fun playItem(index: Int) {
+    if (index !in playlist.indices) return
+    saveState()
+    fileLoaded = false
+    val uri = playlist[index]
+    if (history.isLocalFileMissing(uri)) {
+      Log.w(TAG, "Skipping missing playlist item at index $index: $uri")
+      Toast.makeText(this, R.string.toast_file_no_longer_exists, Toast.LENGTH_SHORT).show()
+      if (index + 1 < playlist.size) {
+        playItem(index + 1)
+      } else if (playerPreferences.closeAfterReachingEndOfVideo.get()) {
+        finish()
+      }
+      return
+    }
+
+    playlistIndex = index
+    currentUri = uri
+    onPlaylistItem = true
+    fileName = history.fileName(uri)
+    mediaIdentifier = history.mediaIdentifier(uri, fileName)
+    if (HttpUtils.isNetworkStream(uri)) {
+      HttpUtils.extractRefererDomain(uri)?.let {
+        MPVLib.setPropertyString("http-header-fields", "Referer: ${it.replace(",", "\\,")}")
+      }
+    }
+    playlistId?.let { id ->
+      lifecycleScope.launch(Dispatchers.IO) {
+        runCatching { playlistRepository.updatePlayHistory(id, history.historyPath(uri)) }
+          .onFailure { Log.e(TAG, "Error updating playlist history", it) }
+      }
+    }
+    MPVLib.command("loadfile", uri.openContentFd(this) ?: uri.toString())
   }
 
   private fun destroyMpv() {
@@ -250,9 +381,7 @@ class XrPlayerActivity : ComponentActivity() {
     override fun eventProperty(property: String, value: Boolean) {
       when (property) {
         "pause" -> playing = !value
-        "eof-reached" -> if (value && playerPreferences.closeAfterReachingEndOfVideo.get()) {
-          runOnUiThread { finish() }
-        }
+        "eof-reached" -> if (value) runOnUiThread { onEndOfFile() }
       }
     }
 
@@ -271,18 +400,43 @@ class XrPlayerActivity : ComponentActivity() {
 
   private fun onFileLoaded() {
     playing = MPVLib.getPropertyBoolean("pause") == false
-    if (!subtitlesPreferences.autoloadMatchingSubtitles.get()) return
+    fileLoaded = true
+    val identifier = mediaIdentifier
+    val name = fileName
     val current = intent
-    val fileName = current.getStringExtra("title") ?: current.getStringExtra("filename")
-      ?: current.data?.lastPathSegment ?: return
+    val item = if (onPlaylistItem) currentUri else null
+
+    // Resume where this file was left (in either player), then pick default tracks if it's new.
+    lifecycleScope.launch(Dispatchers.IO) {
+      val hasState = history.restore(identifier)
+      trackSelector.onFileLoaded(hasState)
+    }
+
+    lifecycleScope.launch(Dispatchers.IO) {
+      val playlistItem = playlist.getOrNull(playlistIndex)
+      if (playlist.isNotEmpty() && playlistItem != null) {
+        history.addRecentlyPlayed(playlistItem, name, "playlist", playlistId)
+      } else {
+        val launchSource = when {
+          current.getStringExtra("launch_source") != null -> current.getStringExtra("launch_source")
+          current.action == Intent.ACTION_SEND -> "share"
+          else -> "normal"
+        }
+        currentUri?.let { history.addRecentlyPlayed(it, name, launchSource) }
+      }
+    }
+
+    if (!subtitlesPreferences.autoloadMatchingSubtitles.get()) return
     lifecycleScope.launch {
       // Mirrors PlayerActivity: network files look for subtitles next to the original remote path.
       val networkPath = current.getStringExtra("network_file_path")
       val connectionId = current.getLongExtra("network_connection_id", -1L)
-      if (networkPath != null && connectionId != -1L) {
-        SubtitleOps.autoloadSubtitles(networkPath, fileName, connectionId)
+      if (item != null) {
+        SubtitleOps.autoloadSubtitles(history.historyPath(item), name)
+      } else if (networkPath != null && connectionId != -1L) {
+        SubtitleOps.autoloadSubtitles(networkPath, name, connectionId)
       } else {
-        playablePath(current)?.let { SubtitleOps.autoloadSubtitles(it, fileName) }
+        playablePath(current)?.let { SubtitleOps.autoloadSubtitles(it, name) }
       }
     }
   }
