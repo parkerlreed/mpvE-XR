@@ -17,11 +17,11 @@ headset switches to the immersive CRT player.
 
 1. Install the APK (`arm64-v8a`) with `adb install -r <apk>`.
 2. Quest doesn't show the "All files access" prompt, so grant it over adb (the package is
-   `app.marlboroadvance.mpvex`, or `app.marlboroadvance.mpvex.debug` for debug builds):
+   `io.github.parkerlreed.mpvexr`, or `io.github.parkerlreed.mpvexr.debug` for debug builds):
 
    ```
-   adb shell appops set --uid app.marlboroadvance.mpvex MANAGE_EXTERNAL_STORAGE allow
-   adb shell am force-stop app.marlboroadvance.mpvex
+   adb shell appops set --uid io.github.parkerlreed.mpvexr MANAGE_EXTERNAL_STORAGE allow
+   adb shell am force-stop io.github.parkerlreed.mpvexr
    ```
 3. Open mpvEx from the app library and pick a video. To use the regular player instead, turn off
    *Settings → Player → Play on a virtual CRT (Quest)*.
@@ -41,10 +41,10 @@ have to download it yourself:
 3. Copy it to the headset as `tv.glb` in the app's files folder:
 
    ```
-   adb shell mkdir -p /sdcard/Android/data/app.marlboroadvance.mpvex/files
-   adb push crt_tv.glb /sdcard/Android/data/app.marlboroadvance.mpvex/files/tv.glb
+   adb shell mkdir -p /sdcard/Android/data/io.github.parkerlreed.mpvexr/files
+   adb push crt_tv.glb /sdcard/Android/data/io.github.parkerlreed.mpvexr/files/tv.glb
    ```
-   (For debug builds, use `app.marlboroadvance.mpvex.debug` in both paths.)
+   (For debug builds, use `io.github.parkerlreed.mpvexr.debug` in both paths.)
 
 The next video you open uses the model. Delete `tv.glb` to go back to the built-in TV/VCR.
 `adb logcat -s mpvEx-XR` reports whether it loaded.

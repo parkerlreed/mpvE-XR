@@ -16,7 +16,8 @@ android {
   ndkVersion = "29.0.14206865"
 
   defaultConfig {
-    applicationId = "app.marlboroadvance.mpvex"
+    // Distinct from upstream mpvEx so both can be installed; the namespace stays upstream's.
+    applicationId = "io.github.parkerlreed.mpvexr"
     minSdk = 26
     targetSdk = 36
     versionCode = 131
