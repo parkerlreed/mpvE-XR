@@ -58,6 +58,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import app.marlboroadvance.mpvex.preferences.XrPreferences
 import app.marlboroadvance.mpvex.ui.player.xr.XrSupport
 import org.koin.android.ext.android.inject
 import java.io.File
@@ -118,6 +119,7 @@ class PlayerActivity :
    * Preferences for player settings.
    */
   private val playerPreferences: PlayerPreferences by inject()
+  private val xrPreferences: XrPreferences by inject()
 
   /** Set when this launch was handed to [XrPlayerActivity]; mpv and the UI were never set up. */
   private var forwardedToXr = false
@@ -336,7 +338,7 @@ class PlayerActivity :
 
     // On Quest, every player launch (browser, playlists, network, external apps) goes to the
     // immersive CRT player. finish() from onCreate skips straight to onDestroy.
-    if (XrSupport.shouldUseXrPlayer(intent, playerPreferences)) {
+    if (XrSupport.shouldUseXrPlayer(intent, xrPreferences)) {
       forwardedToXr = true
       startActivity(XrSupport.xrIntent(this, intent))
       finish()

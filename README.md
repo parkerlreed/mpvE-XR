@@ -24,8 +24,12 @@ headset switches to the immersive CRT player.
    adb shell appops set --uid io.github.parkerlreed.mpvexr MANAGE_EXTERNAL_STORAGE allow
    adb shell am force-stop io.github.parkerlreed.mpvexr
    ```
-3. Open mpvEx from the app library and pick a video. To use the regular player instead, turn off
-   *Settings → Player → Play on a virtual CRT (Quest)*.
+3. Open mpvE-XR from the app library and pick a video. To use the regular player instead, turn off
+   *Settings → VR (Quest) → Play on a virtual CRT*.
+
+*Settings → VR (Quest)* also has the video resolution, a custom-model toggle, reset TV position,
+scanline and glass-reflection strength, room dimming and colour, hand occlusion padding, the
+menu-gesture distance, and the short/long seek lengths.
 
 ## Optional: realistic TV model
 

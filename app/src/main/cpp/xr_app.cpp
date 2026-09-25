@@ -45,6 +45,31 @@ constexpr float kSizePresetsInches[] = {14, 20, 27, 32, 40};
 
 constexpr int kLeft = 0, kRight = 1;
 
+// VR preferences from Kotlin, in XrPlayerActivity.nativeSettings() order.
+struct XrSettings {
+  float handPadding = 0.004f;        // metres the hand cutout is grown by
+  float passthroughOpacity = 1.0f;   // 1 - room dimming
+  float passthroughSaturation = 1.0f;
+  float scanlines = 0.35f;
+  bool scanlineFade = true;
+  float reflections = 1.0f;
+  float reachDistance = 0.6f;        // where the menu gesture puts the set
+
+  void read(JNIEnv* env, jfloatArray array) {
+    if (!array) return;
+    float v[7];
+    jsize n = std::min<jsize>(env->GetArrayLength(array), 7);
+    env->GetFloatArrayRegion(array, 0, n, v);
+    if (n > 0) handPadding = std::clamp(v[0], 0.0f, 0.03f);
+    if (n > 1) passthroughOpacity = std::clamp(v[1], 0.0f, 1.0f);
+    if (n > 2) passthroughSaturation = std::clamp(v[2], 0.0f, 1.0f);
+    if (n > 3) scanlines = std::clamp(v[3], 0.0f, 1.0f);
+    if (n > 4) scanlineFade = v[4] > 0.5f;
+    if (n > 5) reflections = std::clamp(v[5], 0.0f, 1.0f);
+    if (n > 6) reachDistance = std::clamp(v[6], 0.3f, 1.5f);
+  }
+};
+
 struct Bridge {
   JNIEnv* env = nullptr;
   jobject obj = nullptr;
@@ -181,10 +206,11 @@ struct Hand {
 class XrApp {
  public:
   bool run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initialPose,
-           const char* modelPath);
+           const char* modelPath, jfloatArray settings);
 
  private:
   Bridge bridge_;
+  XrSettings settings_;
 
   // EGL
   EGLDisplay display_ = EGL_NO_DISPLAY;
@@ -223,6 +249,7 @@ class XrApp {
   PFN_xrDestroyPassthroughFB xrDestroyPassthroughFB_ = nullptr;
   PFN_xrCreatePassthroughLayerFB xrCreatePassthroughLayerFB_ = nullptr;
   PFN_xrDestroyPassthroughLayerFB xrDestroyPassthroughLayerFB_ = nullptr;
+  PFN_xrPassthroughLayerSetStyleFB xrPassthroughLayerSetStyleFB_ = nullptr;
 
   bool handTrackingSupported_ = false;
   bool handAimSupported_ = false;
@@ -382,6 +409,7 @@ bool XrApp::initInstance(JNIEnv* env, jobject activity) {
     load("xrDestroyPassthroughFB", xrDestroyPassthroughFB_);
     load("xrCreatePassthroughLayerFB", xrCreatePassthroughLayerFB_);
     load("xrDestroyPassthroughLayerFB", xrDestroyPassthroughLayerFB_);
+    load("xrPassthroughLayerSetStyleFB", xrPassthroughLayerSetStyleFB_);
     passthroughSupported_ = xrCreatePassthroughFB_ && xrDestroyPassthroughFB_ &&
                             xrCreatePassthroughLayerFB_ && xrDestroyPassthroughLayerFB_;
   }
@@ -584,6 +612,23 @@ void XrApp::initPassthrough() {
     xrDestroyPassthroughFB_(passthrough_);
     passthrough_ = XR_NULL_HANDLE;
     passthroughSupported_ = false;
+    return;
+  }
+
+  // Room dimming fades passthrough towards black; saturation greys it out.
+  if (xrPassthroughLayerSetStyleFB_ &&
+      (settings_.passthroughOpacity < 1.0f || settings_.passthroughSaturation < 1.0f)) {
+    XrPassthroughBrightnessContrastSaturationFB bcs{XR_TYPE_PASSTHROUGH_BRIGHTNESS_CONTRAST_SATURATION_FB};
+    bcs.brightness = 0.0f;
+    bcs.contrast = 1.0f;
+    bcs.saturation = settings_.passthroughSaturation;
+    XrPassthroughStyleFB style{XR_TYPE_PASSTHROUGH_STYLE_FB};
+    style.next = &bcs;
+    style.textureOpacityFactor = settings_.passthroughOpacity;
+    style.edgeColor = {0, 0, 0, 0};
+    if (XR_FAILED(xrPassthroughLayerSetStyleFB_(passthroughLayer_, &style))) {
+      LOGE("xrPassthroughLayerSetStyleFB failed");
+    }
   }
 }
 
@@ -950,7 +995,7 @@ void XrApp::updateTrackedHand(int h, float dt) {
   hand.pokeArmed = false;
 
   // Within arm's reach, so the buttons can be poked.
-  if (hand.menuGesture) placeInFront(0.6f, 0.25f);
+  if (hand.menuGesture) placeInFront(settings_.reachDistance, 0.25f);
 
   // Laser: pinch acts like the trigger, and a held pinch on the set grabs it.
   if (!hand.aimValid) {
@@ -1028,7 +1073,7 @@ int XrApp::collectOccluders(int h, float* spheres, int max) const {
       const XrHandJointLocationEXT& l = hand.joints[j];
       if (!(l.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) return false;
       *p = {l.pose.position.x, l.pose.position.y, l.pose.position.z};
-      *r = std::max(l.radius, 0.006f) * 1.25f + 0.003f;
+      *r = std::max(l.radius, 0.006f) * 1.1f + settings_.handPadding;
       return true;
     };
     Vec3 palm;
@@ -1239,7 +1284,7 @@ void XrApp::renderEye(int eyeIndex, const XrView& view, uint32_t imageIndex) {
         skin[j] = Mat4::fromPose(fromXr(l.pose) * inverse(hand.bindPoses[j]));
       }
       if (skinned) {
-        scene_.drawHandMesh(h, viewProj, skin, 0.004f);
+        scene_.drawHandMesh(h, viewProj, skin, settings_.handPadding);
       } else {
         float spheres[CrtScene::kMaxOccluders * 4];
         int count = collectOccluders(h, spheres, CrtScene::kMaxOccluders);
@@ -1338,7 +1383,8 @@ void XrApp::frame() {
 }
 
 bool XrApp::run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initialPose,
-                const char* modelPath) {
+                const char* modelPath, jfloatArray settings) {
+  settings_.read(env, settings);
   if (!bridge_.init(env, bridge)) return false;
 
   bool ok = initInstance(env, activity) && initEgl() && initSession() && initSwapchains() &&
@@ -1350,6 +1396,7 @@ bool XrApp::run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initi
     return false;
   }
   initPassthrough();
+  scene_.setPicture(settings_.scanlines, settings_.scanlineFade, settings_.reflections);
   initHandTracking();
 
   if (initialPose && env->GetArrayLength(initialPose) == 8 && stageSpace_) {
@@ -1405,7 +1452,7 @@ bool XrApp::run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initi
 extern "C" JNIEXPORT jboolean JNICALL
 Java_app_marlboroadvance_mpvex_ui_player_xr_XrNative_run(JNIEnv* env, jclass, jobject activity,
                                                          jobject bridge, jfloatArray initialPose,
-                                                         jstring modelPath) {
+                                                         jstring modelPath, jfloatArray settings) {
   gExitRequested.store(false);
   std::string path;
   if (modelPath) {
@@ -1414,7 +1461,7 @@ Java_app_marlboroadvance_mpvex_ui_player_xr_XrNative_run(JNIEnv* env, jclass, jo
     env->ReleaseStringUTFChars(modelPath, chars);
   }
   XrApp app;
-  return app.run(env, activity, bridge, initialPose, path.c_str()) ? JNI_TRUE : JNI_FALSE;
+  return app.run(env, activity, bridge, initialPose, path.c_str(), settings) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL

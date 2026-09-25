@@ -38,9 +38,16 @@ object XrNative {
    * thread. Returns false if OpenXR could not be initialised on this device.
    *
    * [modelPath] points at an optional glTF TV; the built-in set is used if it is missing or bad.
+   * [settings] carries the VR preferences in the order XrPlayerActivity.nativeSettings() builds.
    */
   @JvmStatic
-  external fun run(activity: Activity, bridge: XrBridge, initialPose: FloatArray?, modelPath: String?): Boolean
+  external fun run(
+    activity: Activity,
+    bridge: XrBridge,
+    initialPose: FloatArray?,
+    modelPath: String?,
+    settings: FloatArray,
+  ): Boolean
 
   /** Asks the running session to exit; [run] returns shortly after. */
   @JvmStatic

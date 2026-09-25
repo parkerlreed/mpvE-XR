@@ -49,6 +49,13 @@ class CrtScene {
 
   void setVideo(GLuint externalTexture, const float* texMatrix, bool hasFrame);
   void setPlaying(bool playing) { playing_ = playing; }
+  // Scanline strength 0..1, whether they fade out as they get too fine to show, and glass
+  // reflection strength 0..1.
+  void setPicture(float scanlines, bool scanlineFade, float reflections) {
+    scanlines_ = scanlines;
+    scanlineFade_ = scanlineFade;
+    reflections_ = reflections;
+  }
   // Bit i set means button i is hovered / held.
   void setButtonState(uint32_t hovered, uint32_t pressed) {
     hoveredButtons_ = hovered;
@@ -101,6 +108,9 @@ class CrtScene {
   float texMatrix_[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
   bool hasFrame_ = false;
   bool playing_ = false;
+  float scanlines_ = 0.35f;
+  bool scanlineFade_ = true;
+  float reflections_ = 1.0f;
   uint32_t hoveredButtons_ = 0, pressedButtons_ = 0;
 
   void drawProcedural(const Mat4& model, const Mat4& viewProj, Vec3 eye);

@@ -22,6 +22,7 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Subtitles
+import androidx.compose.material.icons.outlined.ViewInAr
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -38,6 +39,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.marlboroadvance.mpvex.R
 import app.marlboroadvance.mpvex.presentation.Screen
+import app.marlboroadvance.mpvex.ui.player.xr.XrSupport
 import app.marlboroadvance.mpvex.ui.utils.LocalBackStack
 import kotlinx.serialization.Serializable
 import me.zhanghai.compose.preference.Preference
@@ -205,6 +207,28 @@ object PreferencesScreen : Screen {
                 },
                 onClick = { backstack.add(GesturePreferencesScreen) },
               )
+
+              if (XrSupport.isQuest) {
+                PreferenceDivider()
+
+                Preference(
+                  title = { Text(text = stringResource(id = R.string.pref_vr)) },
+                  summary = {
+                    Text(
+                      text = stringResource(id = R.string.pref_vr_summary),
+                      color = MaterialTheme.colorScheme.outline
+                    )
+                  },
+                  icon = {
+                    Icon(
+                      Icons.Outlined.ViewInAr,
+                      contentDescription = null,
+                      tint = MaterialTheme.colorScheme.primary
+                    )
+                  },
+                  onClick = { backstack.add(VrPreferencesScreen) },
+                )
+              }
             }
           }
           

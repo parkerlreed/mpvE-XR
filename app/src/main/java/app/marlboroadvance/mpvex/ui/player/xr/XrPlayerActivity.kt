@@ -12,11 +12,11 @@ import android.view.Surface
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.core.content.edit
 import androidx.lifecycle.lifecycleScope
 import app.marlboroadvance.mpvex.R
 import app.marlboroadvance.mpvex.preferences.PlayerPreferences
 import app.marlboroadvance.mpvex.preferences.SubtitlesPreferences
+import app.marlboroadvance.mpvex.preferences.XrPreferences
 import app.marlboroadvance.mpvex.ui.player.MPVView
 import app.marlboroadvance.mpvex.ui.player.PlayerActivity
 import app.marlboroadvance.mpvex.ui.player.resolveUri
@@ -27,7 +27,6 @@ import `is`.xyz.mpv.MPVNode
 import `is`.xyz.mpv.Utils
 import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
-import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -55,8 +54,8 @@ class XrPlayerActivity : ComponentActivity() {
   }
 
   private val playerPreferences: PlayerPreferences by inject()
+  private val xrPreferences: XrPreferences by inject()
   private val subtitlesPreferences: SubtitlesPreferences by inject()
-  private val poseStore by lazy { getSharedPreferences(POSE_PREFS, MODE_PRIVATE) }
 
   private lateinit var player: MPVView
   private var mpvInitialized = false
@@ -92,7 +91,9 @@ class XrPlayerActivity : ComponentActivity() {
     pendingPath = path
 
     renderThread = thread(name = "mpvEx-XR") {
-      val ok = XrNative.run(this, bridge, loadCrtPose(), customModel()?.path)
+      val model = XrSupport.customModelFile(this)
+        ?.takeIf { xrPreferences.useCustomModel.get() && it.isFile }
+      val ok = XrNative.run(this, bridge, XrSupport.loadTvPose(this), model?.path, nativeSettings())
       if (!ok) runOnUiThread { fallBackTo2d() }
     }
   }
@@ -148,9 +149,10 @@ class XrPlayerActivity : ComponentActivity() {
   private val bridge = object : XrBridge {
     override fun onGlReady(texture: Int, screenAspect: Float) {
       // Match the glass so mpv letterboxes against the real screen shape; keep the width even.
-      val width = ((SURFACE_HEIGHT * screenAspect).toInt() / 2 * 2).coerceIn(SURFACE_HEIGHT, SURFACE_HEIGHT * 2)
+      val height = xrPreferences.videoHeight.get().takeIf { it in XrPreferences.VIDEO_HEIGHTS } ?: 1080
+      val width = ((height * screenAspect).toInt() / 2 * 2).coerceIn(height, height * 2)
       val st = SurfaceTexture(texture).apply {
-        setDefaultBufferSize(width, SURFACE_HEIGHT)
+        setDefaultBufferSize(width, height)
         setOnFrameAvailableListener({ frameAvailable.set(true) }, Handler(Looper.getMainLooper()))
       }
       val s = Surface(st)
@@ -160,7 +162,7 @@ class XrPlayerActivity : ComponentActivity() {
       // Equivalent of BaseMPVView.surfaceCreated, with our texture-backed surface.
       MPVLib.attachSurface(s)
       MPVLib.setOptionString("force-window", "yes")
-      MPVLib.setPropertyString("android-surface-size", "${width}x$SURFACE_HEIGHT")
+      MPVLib.setPropertyString("android-surface-size", "${width}x$height")
       pendingPath?.let { MPVLib.command("loadfile", it) }
       pendingPath = null
     }
@@ -182,7 +184,7 @@ class XrPlayerActivity : ComponentActivity() {
     }
 
     override fun onCrtPoseChanged(pose: FloatArray) {
-      poseStore.edit { putString(KEY_CRT_POSE, pose.joinToString(",")) }
+      XrSupport.saveTvPose(this@XrPlayerActivity, pose)
     }
 
     override fun onSessionEnded() {
@@ -206,10 +208,10 @@ class XrPlayerActivity : ComponentActivity() {
         MPVLib.command("cycle", "pause")
         MPVLib.command("show-text", "\${?pause==yes:Paused}\${?pause==no:Playing}")
       }
-      Action.SEEK_BACK -> seek(-SEEK_SECONDS)
-      Action.SEEK_FORWARD -> seek(SEEK_SECONDS)
-      Action.SEEK_BACK_LONG -> seek(-LONG_SEEK_SECONDS)
-      Action.SEEK_FORWARD_LONG -> seek(LONG_SEEK_SECONDS)
+      Action.SEEK_BACK -> seek(-xrPreferences.shortSeekSeconds.get())
+      Action.SEEK_FORWARD -> seek(xrPreferences.shortSeekSeconds.get())
+      Action.SEEK_BACK_LONG -> seek(-xrPreferences.longSeekSeconds.get())
+      Action.SEEK_FORWARD_LONG -> seek(xrPreferences.longSeekSeconds.get())
       Action.STOP -> {
         MPVLib.setPropertyBoolean("pause", true)
         MPVLib.command("show-text", "Stop")
@@ -322,33 +324,20 @@ class XrPlayerActivity : ComponentActivity() {
     }
   }
 
-  /**
-   * A user-supplied TV model, e.g. pushed with
-   * `adb push tv.glb /sdcard/Android/data/<package>/files/tv.glb`. Not bundled, since downloaded
-   * models usually can't be redistributed.
-   */
-  private fun customModel(): File? =
-    getExternalFilesDir(null)?.let { File(it, MODEL_FILE_NAME) }?.takeIf { it.isFile }
-
-  private fun loadCrtPose(): FloatArray? =
-    poseStore.getString(KEY_CRT_POSE, null)
-      ?.split(',')
-      ?.mapNotNull { it.toFloatOrNull() }
-      ?.takeIf { it.size == 8 }
-      ?.toFloatArray()
+  /** Mirrors XrSettings in xr_app.cpp; order matters. */
+  private fun nativeSettings(): FloatArray =
+    floatArrayOf(
+      xrPreferences.handOcclusionPaddingMm.get() / 1000f,
+      1f - xrPreferences.roomDimming.get().coerceIn(0, 100) / 100f,
+      xrPreferences.roomSaturation.get().coerceIn(0, 100) / 100f,
+      xrPreferences.scanlines.get().coerceIn(0, 100) / 100f,
+      if (xrPreferences.scanlinesFadeWithDistance.get()) 1f else 0f,
+      xrPreferences.glassReflections.get().coerceIn(0, 100) / 100f,
+      xrPreferences.reachDistanceCm.get() / 100f,
+    )
 
   companion object {
     private const val TAG = "XrPlayerActivity"
-    private const val POSE_PREFS = "xr_player"
-    private const val KEY_CRT_POSE = "crt_pose"
-
-    private const val MODEL_FILE_NAME = "tv.glb"
-
-    // Width follows the TV's screen aspect; mpv letterboxes widescreen content inside it.
-    private const val SURFACE_HEIGHT = 1080
-
-    private const val SEEK_SECONDS = 10
-    private const val LONG_SEEK_SECONDS = 300
     private const val VOLUME_STEP = 5
     private const val RENDER_THREAD_JOIN_MS = 3000L
   }

@@ -30,7 +30,6 @@ import kotlinx.serialization.Serializable
 import me.zhanghai.compose.preference.ListPreference
 import me.zhanghai.compose.preference.ProvidePreferenceLocals
 import me.zhanghai.compose.preference.SliderPreference
-import app.marlboroadvance.mpvex.ui.player.xr.XrSupport
 import me.zhanghai.compose.preference.SwitchPreference
 import org.koin.compose.koinInject
 import kotlin.math.roundToInt
@@ -115,17 +114,6 @@ object PlayerPreferencesScreen : Screen {
               
               PreferenceDivider()
 
-              if (XrSupport.isQuest) {
-                val useXrPlayer by preferences.useXrPlayerOnQuest.collectAsState()
-                SwitchPreference(
-                  value = useXrPlayer,
-                  onValueChange = preferences.useXrPlayerOnQuest::set,
-                  title = { Text(stringResource(id = R.string.pref_player_xr_player)) },
-                  summary = { Text(stringResource(id = R.string.pref_player_xr_player_summary)) },
-                )
-
-                PreferenceDivider()
-              }
               
               val autoplayNextVideo by preferences.autoplayNextVideo.collectAsState()
               SwitchPreference(

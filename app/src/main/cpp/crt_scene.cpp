@@ -56,7 +56,6 @@ constexpr float kScreenEdgeZ = -0.02f;
 constexpr float kScreenBulge = 0.014f;
 // Effective scanline count across the tube height.
 constexpr float kScanlines = 240.0f;
-constexpr float kScanlineStrength = 0.35f;
 
 const char* kLitVs = R"(#version 300 es
 layout(location = 0) in vec3 aPos;
@@ -112,6 +111,8 @@ uniform float uHasFrame;
 uniform vec3 uEye;
 uniform float uLines;
 uniform float uScanlineStrength;
+uniform float uScanlineFade;
+uniform float uReflections;
 // Glass extent in its UVs (min.xy, max.xy); the video covers all of it.
 uniform vec4 uVideoRect;
 uniform vec2 uVideoFlip;
@@ -136,7 +137,8 @@ void main() {
   // Scanlines, faded out once they get close to pixel size to avoid moire.
   float phase = pic.y * uLines;
   float fw = fwidth(phase);
-  float strength = uScanlineStrength * clamp(1.0 - (fw - 0.2) * 2.5, 0.0, 1.0);
+  float fade = mix(1.0, clamp(1.0 - (fw - 0.2) * 2.5, 0.0, 1.0), uScanlineFade);
+  float strength = uScanlineStrength * fade;
   float line = 0.5 + 0.5 * cos(phase * 6.2831853);
   video *= mix(1.0, (0.55 + 0.45 * line) * 1.2, strength);
 
@@ -158,7 +160,8 @@ void main() {
     maskColor = texture(uMask, vUv).rgb * ao;
     inside = smoothstep(uMaskThreshold * 0.7, uMaskThreshold * 1.3, dot(maskColor, vec3(1.0 / 3.0)));
   }
-  vec3 c = mix(maskColor, glass + video, inside) + vec3(0.02) * fresnel + vec3(0.05) * highlight;
+  vec3 c = mix(maskColor, glass + video, inside) +
+           (vec3(0.02) * fresnel + vec3(0.05) * highlight) * uReflections;
   fragColor = vec4(c, 1.0);
 }
 )";
@@ -710,7 +713,9 @@ void CrtScene::draw(const Mat4& viewProj, Vec3 eye, const Pose& crtPose, float c
   glUniform1f(glGetUniformLocation(screenProgram_, "uHasFrame"),
               hasFrame_ && videoTexture_ ? 1.0f : 0.0f);
   glUniform1f(glGetUniformLocation(screenProgram_, "uLines"), kScanlines);
-  glUniform1f(glGetUniformLocation(screenProgram_, "uScanlineStrength"), kScanlineStrength);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uScanlineStrength"), scanlines_);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uScanlineFade"), scanlineFade_ ? 1.0f : 0.0f);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uReflections"), reflections_);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
   glUniform1i(glGetUniformLocation(screenProgram_, "uTex"), 0);
