@@ -58,6 +58,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import app.marlboroadvance.mpvex.ui.player.xr.XrSupport
 import org.koin.android.ext.android.inject
 import java.io.File
 
@@ -117,6 +118,9 @@ class PlayerActivity :
    * Preferences for player settings.
    */
   private val playerPreferences: PlayerPreferences by inject()
+
+  /** Set when this launch was handed to [XrPlayerActivity]; mpv and the UI were never set up. */
+  private var forwardedToXr = false
 
   /**
    * Preferences for audio settings.
@@ -329,6 +333,16 @@ class PlayerActivity :
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+
+    // On Quest, every player launch (browser, playlists, network, external apps) goes to the
+    // immersive CRT player. finish() from onCreate skips straight to onDestroy.
+    if (XrSupport.shouldUseXrPlayer(intent, playerPreferences)) {
+      forwardedToXr = true
+      startActivity(XrSupport.xrIntent(this, intent))
+      finish()
+      return
+    }
+
     setContentView(binding.root)
 
     // OPTIMIZATION: Set volume control stream so hardware buttons control media volume
@@ -568,6 +582,10 @@ class PlayerActivity :
 
   @RequiresApi(Build.VERSION_CODES.P)
   override fun onDestroy() {
+    if (forwardedToXr) {
+      super.onDestroy()
+      return
+    }
     Log.d(TAG, "PlayerActivity onDestroy")
 
     runCatching {
@@ -702,6 +720,10 @@ class PlayerActivity :
 
   @RequiresApi(Build.VERSION_CODES.P)
   override fun finish() {
+    if (forwardedToXr) {
+      super.finish()
+      return
+    }
     runCatching {
       // Don't restore UI during normal finish to prevent flickering
       // System will handle UI restoration automatically

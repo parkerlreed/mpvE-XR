@@ -125,6 +125,10 @@
   <string name="pref_player_custom_skip_duration_summary">Duration to skip forward on custom skip button</string>
   <string name="pref_player_seeking_title">Seeking</string>
   <string name="pref_player_close_after_eof">Close after the end of playback</string>
+  <string name="pref_player_xr_player">Play on a virtual CRT (Quest)</string>
+  <string name="pref_player_xr_player_summary">Open videos in passthrough on a TV you can grab and place anywhere in the room</string>
+  <string name="xr_player_unavailable">VR player unavailable, using the regular player</string>
+  <string name="xr_player_unsupported_source">This source cannot be opened in the VR player</string>
   <string name="pref_player_remember_brightness">Remember display brightness</string>
   <string name="pref_player_gestures">Gestures</string>
   <string name="pref_player_gestures_brightness">Brightness gestures</string>

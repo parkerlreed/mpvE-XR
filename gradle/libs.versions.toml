@@ -17,6 +17,7 @@ sardineAndroid = "0.8"
 reorderable = "3.0.0"
 aboutLibraries = "15.1.1"
 mpv-android = "1.0.0"
+openxr-loader = "1.1.63"
 
 [libraries]
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
@@ -44,6 +45,7 @@ androidx-documentfile = { group = "androidx.documentfile", name = "documentfile"
 seeker = "com.github.abdallahmehiz:seeker:2.0.1"
 mediainfo-lib = "com.github.marlboro-advance:mediainfoAndroid:v1.0.0-fix"
 mpv-android = { module = "io.github.marlboro-advance:mpv-android", version.ref = "mpv-android" }
+openxr-loader = { module = "org.khronos.openxr:openxr_loader_for_android", version.ref = "openxr-loader" }
 
 koin-bom = { module = "io.insert-koin:koin-bom", version.ref = "koin" }
 koin-core = { module = "io.insert-koin:koin-core" }

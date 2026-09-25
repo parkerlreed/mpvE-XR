@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Inflated off-screen by XrPlayerActivity so MPVView gets its usual attributes and options. -->
+<app.marlboroadvance.mpvex.ui.player.MPVView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent" />

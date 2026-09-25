@@ -23,6 +23,15 @@
         android:name="android.hardware.usb.host"
         android:required="false" />
 
+    <!-- Quest: optional so phones still install; the XR player is only used on Quest. -->
+    <uses-feature
+        android:name="android.hardware.vr.headtracking"
+        android:required="false"
+        android:version="1" />
+    <uses-feature
+        android:name="com.oculus.feature.PASSTHROUGH"
+        android:required="false" />
+
     <application
         android:name=".App"
         android:appCategory="video"
@@ -45,6 +54,24 @@
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Immersive OpenXR player; PlayerActivity forwards here on Quest. -->
+        <activity
+            android:name=".ui.player.xr.XrPlayerActivity"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:screenOrientation="landscape"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            tools:ignore="DiscouragedApi,LockedOrientationActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
         </activity>
 

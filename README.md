@@ -1,3 +1,109 @@
+# mpvE-XR
+
+**mpvE-XR is a fork of [mpvExtended](https://github.com/marlboro-advance/mpvEx) that adds an immersive
+player for standalone Meta Quest.** Videos play in passthrough on a CRT television you can grab and
+place anywhere in your room. Everything else (library, file browser, SMB/FTP/WebDAV, playlists,
+subtitles, mpv settings) is the regular mpvEx app running as a 2D panel. When you pick a video, the
+headset switches to the immersive CRT player.
+
+- OpenXR (native C++/GLES), Meta passthrough, runs on the headset (no PC)
+- mpv renders straight onto the TV's curved glass, using all your usual mpv/mpvEx settings
+- Grab, push/pull, spin and resize the TV; its position is remembered between sessions
+- Pressable buttons on the set, plus controller shortcuts
+- Built-in TV/VCR combo, or drop in a realistic glTF model (see below)
+- On phones and tablets the app behaves like normal mpvEx
+
+## Install
+
+1. Install the APK (`arm64-v8a`) with `adb install -r <apk>`.
+2. Quest doesn't show the "All files access" prompt, so grant it over adb (the package is
+   `app.marlboroadvance.mpvex`, or `app.marlboroadvance.mpvex.debug` for debug builds):
+
+   ```
+   adb shell appops set --uid app.marlboroadvance.mpvex MANAGE_EXTERNAL_STORAGE allow
+   adb shell am force-stop app.marlboroadvance.mpvex
+   ```
+3. Open mpvEx from the app library and pick a video. To use the regular player instead, turn off
+   *Settings → Player → Play on a virtual CRT (Quest)*.
+
+## Optional: realistic TV model
+
+The app can load the [CRT TV](https://sketchfab.com/3d-models/crt-tv-9ba4baa106e64319a0b540cf0af5aa9e)
+model by [Timothy Ahene](https://sketchfab.com/timothyahene) in place of the built-in set. It uses
+the model's own screen for the video and its own front-panel buttons as controls.
+Its license (Sketchfab Standard) doesn't allow redistribution, so it isn't included here and you
+have to download it yourself:
+
+1. On the [model page](https://sketchfab.com/3d-models/crt-tv-9ba4baa106e64319a0b540cf0af5aa9e), sign
+   in and click **Download 3D Model**.
+2. Choose the **GLB** option. It's listed at about **1 MB** (the file is ~1.8 MB). Don't pick the
+   ~30 MB download.
+3. Copy it to the headset as `tv.glb` in the app's files folder:
+
+   ```
+   adb shell mkdir -p /sdcard/Android/data/app.marlboroadvance.mpvex/files
+   adb push crt_tv.glb /sdcard/Android/data/app.marlboroadvance.mpvex/files/tv.glb
+   ```
+   (For debug builds, use `app.marlboroadvance.mpvex.debug` in both paths.)
+
+The next video you open uses the model. Delete `tv.glb` to go back to the built-in TV/VCR.
+`adb logcat -s mpvEx-XR` reports whether it loaded.
+
+Any `.glb` with a mesh (or material) named like `screen` will load. The front-panel button
+mapping below is specific to this model.
+
+## Controls (Touch controllers)
+
+| Input | Action |
+|---|---|
+| Point at the TV + **grip** | Grab it (it stays upright) |
+| While grabbing: stick up/down, left/right | Push away / pull in, spin |
+| While grabbing: stick click | Cycle size: 14, 20, 27, 32, 40" |
+| Left stick click | Bring the TV back in front of you |
+| **A**, or **trigger** on the screen | Play / pause |
+| **B** | Show progress bar |
+| **X** / **Y** | Cycle audio / subtitle track |
+| Stick left/right | Seek ±10 s (hold to repeat) |
+| Right stick up/down | Seek ±5 min (hold to repeat) |
+| Left stick up/down | Volume |
+| Left **menu** button | Back to the browser |
+
+Point at a button on the set and pull the trigger to press it:
+
+| Built-in TV/VCR | Sketchfab CRT TV | Action |
+|---|---|---|
+| ⏏ | POWER | Back to the browser |
+| ⏪ / ⏩ | – | Seek ±10 s (hold to repeat) |
+| ▶❙❙ | ACTION | Play / pause |
+| ■ | – | Stop (pause) |
+| VOL − / + | VOLUME ◀ / ▶ | Volume (hold to repeat) |
+| – | CHANNEL ▲ / ▼ | Seek ±5 min (hold to repeat) |
+| – | TV/VIDEO | Show progress bar |
+
+## Building
+
+Same as mpvEx, plus the NDK (the XR renderer lives in `app/src/main/cpp`). Gradle needs a full JDK
+(with `javac`), not just a JRE:
+
+```
+JAVA_HOME=/path/to/jdk ./gradlew :app:assembleStandardDebug
+```
+
+## Credits
+
+- [mpvExtended](https://github.com/marlboro-advance/mpvEx) and
+  [mpv-android](https://github.com/mpv-android/mpv-android), which this is built on
+- [CRT TV](https://sketchfab.com/3d-models/crt-tv-9ba4baa106e64319a0b540cf0af5aa9e) by
+  [Timothy Ahene](https://sketchfab.com/timothyahene) on Sketchfab (Sketchfab Standard license, not
+  redistributed)
+- [OpenXR loader](https://github.com/KhronosGroup/OpenXR-SDK) (Apache-2.0),
+  [cgltf](https://github.com/jkuhlmann/cgltf) (MIT), [stb_image](https://github.com/nothings/stb)
+  (public domain / MIT)
+
+---
+
+*The original mpvExtended README follows.*
+
 ![banner](fastlane/metadata/android/en-US/images/featureGraphic.png)
 
 # mpvExtended

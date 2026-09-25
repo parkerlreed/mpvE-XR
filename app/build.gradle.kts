@@ -13,6 +13,7 @@ plugins {
 android {
   namespace = "app.marlboroadvance.mpvex"
   compileSdk = 37
+  ndkVersion = "29.0.14206865"
 
   defaultConfig {
     applicationId = "app.marlboroadvance.mpvex"
@@ -107,6 +108,15 @@ android {
     compose = true
     viewBinding = true
     buildConfig = true
+    prefab = true
+  }
+
+  // Native OpenXR renderer for the Quest CRT player.
+  externalNativeBuild {
+    cmake {
+      path = file("src/main/cpp/CMakeLists.txt")
+      version = "3.22.1"
+    }
   }
 
   packaging {
@@ -212,6 +222,7 @@ dependencies {
   implementation(libs.fsaf)
   implementation(libs.mediainfo.lib)
   implementation(libs.mpv.android)
+  implementation(libs.openxr.loader)
 
   // Network protocol libraries
   implementation(libs.smbj)

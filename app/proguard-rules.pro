@@ -73,3 +73,5 @@
     java.lang.Object writeReplace();
     java.lang.Object readResolve();
 }
+# XR player: methods called from native code by name
+-keep class app.marlboroadvance.mpvex.ui.player.xr.** { *; }

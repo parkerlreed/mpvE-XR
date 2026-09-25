@@ -38,6 +38,7 @@ class PlayerPreferences(
   val savePositionOnQuit = preferenceStore.getBoolean("save_position", true)
 
   val closeAfterReachingEndOfVideo = preferenceStore.getBoolean("close_after_eof", true)
+  val useXrPlayerOnQuest = preferenceStore.getBoolean("use_xr_player_on_quest", true)
 
   val rememberBrightness = preferenceStore.getBoolean("remember_brightness")
   val defaultBrightness = preferenceStore.getFloat("default_brightness", -1f)
