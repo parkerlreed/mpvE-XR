@@ -80,7 +80,7 @@ real hands stay visible in front of the TV.
 | Pinch and hold (or pinch and move) on the TV | Grab it; let go to drop it |
 | Pinch on a button | Press it |
 | Poke a button with your index finger | Press it (reach within ~12 cm of the set) |
-| Left palm-up menu gesture | Bring the TV back in front of you |
+| Left palm-up menu gesture | Bring the TV within arm's reach in front of you |
 
 Point at a button on the set and pull the trigger (or pinch, or poke it) to press it:
 

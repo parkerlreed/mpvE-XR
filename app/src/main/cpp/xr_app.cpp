@@ -171,6 +171,11 @@ struct Hand {
   int pokeButton = -1;
   bool pokeArmed = false;      // tip was in front of a button face, so pushing in counts
   std::vector<Pose> bindPoses;  // hand mesh bind pose per joint, when the runtime provides one
+
+  // How long the controller pose has been reported valid but not actually tracked (e.g. it was
+  // put down or lost); past a short grace period we stop treating it as present.
+  float untracked = 0;
+  bool loggedActive = false, loggedTracked = false;
 };
 
 class XrApp {
@@ -259,7 +264,8 @@ class XrApp {
   void repeatHeldButton(int h, float dt);
   int collectOccluders(int h, float* spheres, int max) const;
   void loadHandMesh(int h);
-  void placeInFront();
+  // Puts the set `distance` metres ahead of the viewer, `drop` metres below eye level.
+  void placeInFront(float distance = 1.4f, float drop = 0.05f);
   void haptic(int h, float amplitude);
   void renderEye(int eye, const XrView& view, uint32_t imageIndex);
 };
@@ -715,12 +721,12 @@ void XrApp::haptic(int h, float amplitude) {
   xrApplyHapticFeedback(session_, &info, reinterpret_cast<XrHapticBaseHeader*>(&vibration));
 }
 
-void XrApp::placeInFront() {
+void XrApp::placeInFront(float distance, float drop) {
   if (!haveHead_) return;
   float yaw = yawOf(head_.q);
   Vec3 forward{-std::sin(yaw), 0, -std::cos(yaw)};
-  crtPose_.p = head_.p + forward * 1.4f;
-  crtPose_.p.y = head_.p.y - 0.05f;
+  crtPose_.p = head_.p + forward * distance;
+  crtPose_.p.y = head_.p.y - drop;
   // The screen faces +Z, so the same yaw as the head points it back at the viewer.
   crtPose_.q = axisAngle({0, 1, 0}, yaw);
   crtPlaced_ = true;
@@ -758,11 +764,19 @@ void XrApp::updateInput(XrTime time, float dt) {
     XrActionStatePose poseState{XR_TYPE_ACTION_STATE_POSE};
     xrGetActionStatePose(session_, &get, &poseState);
     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    constexpr XrSpaceLocationFlags kValid =
+        XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    constexpr XrSpaceLocationFlags kTracked =
+        XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
     if (poseState.isActive && XR_SUCCEEDED(xrLocateSpace(hand.aimSpace, appSpace_, time, &location)) &&
-        (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
-        (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
-      hand.aim = fromXr(location.pose);
-      hand.active = true;
+        (location.locationFlags & kValid) == kValid) {
+      hand.untracked = (location.locationFlags & kTracked) == kTracked ? 0.0f : hand.untracked + dt;
+      if (hand.untracked < 0.3f) {
+        hand.aim = fromXr(location.pose);
+        hand.active = true;
+      }
+    } else {
+      hand.untracked = 0;
     }
 
     auto getFloat = [&](XrAction action) {
@@ -797,6 +811,15 @@ void XrApp::updateInput(XrTime time, float dt) {
     }
   }
 
+  for (int h = 0; h < 2; ++h) {
+    Hand& hand = hands_[h];
+    const char* side = h == kLeft ? "left" : "right";
+    if (hand.active != hand.loggedActive) LOGI("%s controller %s", side, hand.active ? "active" : "gone");
+    if (hand.tracked != hand.loggedTracked) LOGI("%s hand %s", side, hand.tracked ? "tracked" : "lost");
+    hand.loggedActive = hand.active;
+    hand.loggedTracked = hand.tracked;
+  }
+
   for (int h = 0; h < 2; ++h) updateHand(h, dt);
 }
 
@@ -818,9 +841,15 @@ void XrApp::locateHand(int h, XrTime time) {
   if (XR_FAILED(xrLocateHandJointsEXT_(hand.tracker, &info, &locations)) || !locations.isActive) {
     return;
   }
+  // A lost hand can still come back "active" with a held pose; only use it while really tracked.
+  constexpr XrSpaceLocationFlags kTracked =
+      XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+  if ((hand.joints[XR_HAND_JOINT_PALM_EXT].locationFlags & kTracked) != kTracked) return;
   hand.tracked = true;
 
-  if (handAimSupported_ && (aim.status & XR_HAND_TRACKING_AIM_VALID_BIT_FB)) {
+  constexpr XrHandTrackingAimFlagsFB kAimUsable =
+      XR_HAND_TRACKING_AIM_COMPUTED_BIT_FB | XR_HAND_TRACKING_AIM_VALID_BIT_FB;
+  if (handAimSupported_ && (aim.status & kAimUsable) == kAimUsable) {
     hand.aimValid = true;
     hand.aim = fromXr(aim.aimPose);
     hand.pinch = aim.pinchStrengthIndex;
@@ -920,7 +949,8 @@ void XrApp::updateTrackedHand(int h, float dt) {
   }
   hand.pokeArmed = false;
 
-  if (hand.menuGesture) placeInFront();
+  // Within arm's reach, so the buttons can be poked.
+  if (hand.menuGesture) placeInFront(0.6f, 0.25f);
 
   // Laser: pinch acts like the trigger, and a held pinch on the set grabs it.
   if (!hand.aimValid) {
