@@ -6,6 +6,10 @@ place anywhere in your room. Everything else (library, file browser, SMB/FTP/Web
 subtitles, mpv settings) is the regular mpvEx app running as a 2D panel. When you pick a video, the
 headset switches to the immersive CRT player.
 
+<p align="center">
+  <img src="docs/screenshot.jpg" width="640" alt="mpvE-XR on Quest: a CRT TV playing video in passthrough next to the Rewind app panel">
+</p>
+
 - OpenXR (native C++/GLES), Meta passthrough, runs on the headset (no PC)
 - mpv renders straight onto the TV's curved glass, using all your usual mpv/mpvEx settings
 - Grab, push/pull, spin and resize the TV; its position is remembered between sessions
