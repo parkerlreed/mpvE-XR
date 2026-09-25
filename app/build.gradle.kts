@@ -20,8 +20,8 @@ android {
     applicationId = "io.github.parkerlreed.mpvexr"
     minSdk = 26
     targetSdk = 36
-    versionCode = 131
-    versionName = "1.3.1"
+    versionCode = 132
+    versionName = "1.3.1.1"
 
     vectorDrawables {
       useSupportLibrary = true
@@ -74,8 +74,23 @@ android {
     }
   }
 
+  // Signs release builds with the keystore named in ~/.gradle/gradle.properties (RELEASE_STORE_FILE
+  // etc.), when present. Without it, release builds stay unsigned as before.
+  val releaseStoreFile = providers.gradleProperty("RELEASE_STORE_FILE").orNull
+  if (releaseStoreFile != null) {
+    signingConfigs {
+      create("release") {
+        storeFile = file(releaseStoreFile)
+        storePassword = providers.gradleProperty("RELEASE_STORE_PASSWORD").orNull
+        keyAlias = providers.gradleProperty("RELEASE_KEY_ALIAS").orNull
+        keyPassword = providers.gradleProperty("RELEASE_KEY_PASSWORD").orNull
+      }
+    }
+  }
+
   buildTypes {
     named("release") {
+      if (releaseStoreFile != null) signingConfig = signingConfigs.getByName("release")
       isMinifyEnabled = true
       isShrinkResources = true
       proguardFiles(
