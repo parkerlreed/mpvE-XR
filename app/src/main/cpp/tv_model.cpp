@@ -296,11 +296,6 @@ bool TvModel::load(const char* path) {
       f[2] -= centre.z;
       boundsMin_ = {std::min(boundsMin_.x, f[0]), std::min(boundsMin_.y, f[1]), std::min(boundsMin_.z, f[2])};
       boundsMax_ = {std::max(boundsMax_.x, f[0]), std::max(boundsMax_.y, f[1]), std::max(boundsMax_.z, f[2])};
-      if (p.screen) {
-        // The video is laid out over the glass by position, not by the model's UVs.
-        f[6] = (f[0] + screenHalfW_) / (2 * screenHalfW_);
-        f[7] = (f[1] + screenHalfH_) / (2 * screenHalfH_);
-      }
     }
   }
 
@@ -355,6 +350,82 @@ bool TvModel::load(const char* path) {
     materialIndex[m] = index;
     return index;
   };
+
+  // 3b. Find the picture area inside the screen texture's painted mask: the lit picture is
+  // noticeably brighter than the black surround, so threshold halfway between the two.
+  for (const PrimitiveData& p : prims) {
+    if (!p.screen || !p.material || !p.material->has_pbr_metallic_roughness) continue;
+    const cgltf_texture* tex = p.material->pbr_metallic_roughness.base_color_texture.texture;
+    if (!tex || !tex->image || !tex->image->buffer_view) break;
+
+    // UV extent of the glass, and which way U and V run across it.
+    float uMin = 1e9f, uMax = -1e9f, vMin = 1e9f, vMax = -1e9f;
+    double su = 0, sv = 0, sx = 0, sy = 0, n = 0;
+    for (size_t v = 0; v < p.verts.size(); v += kFloatsPerVertex) {
+      const float* f = &p.verts[v];
+      uMin = std::min(uMin, f[6]); uMax = std::max(uMax, f[6]);
+      vMin = std::min(vMin, f[7]); vMax = std::max(vMax, f[7]);
+      su += f[6]; sv += f[7]; sx += f[0]; sy += f[1]; n += 1;
+    }
+    double cux = 0, cvy = 0;
+    for (size_t v = 0; v < p.verts.size(); v += kFloatsPerVertex) {
+      const float* f = &p.verts[v];
+      cux += (f[6] - su / n) * (f[0] - sx / n);
+      cvy += (f[7] - sv / n) * (f[1] - sy / n);
+    }
+
+    const auto* bytes = static_cast<const stbi_uc*>(cgltf_buffer_view_data(tex->image->buffer_view));
+    int w = 0, h = 0, comp = 0;
+    stbi_uc* px = stbi_load_from_memory(bytes, static_cast<int>(tex->image->buffer_view->size), &w,
+                                        &h, &comp, 4);
+    if (!px) break;
+    auto clampi = [](int x, int lo, int hi) { return std::max(lo, std::min(hi, x)); };
+    int x0 = clampi(static_cast<int>(std::floor(uMin * w)), 0, w - 1);
+    int x1 = clampi(static_cast<int>(std::ceil(uMax * w)) - 1, 0, w - 1);
+    int y0 = clampi(static_cast<int>(std::floor(vMin * h)), 0, h - 1);
+    int y1 = clampi(static_cast<int>(std::ceil(vMax * h)) - 1, 0, h - 1);
+    auto lum = [&](int x, int y) {
+      const stbi_uc* q = &px[(y * w + x) * 4];
+      return (q[0] + q[1] + q[2]) / 3;
+    };
+    int lo = 255, hi = 0;
+    for (int y = y0; y <= y1; ++y)
+      for (int x = x0; x <= x1; ++x) {
+        int l = lum(x, y);
+        lo = std::min(lo, l);
+        hi = std::max(hi, l);
+      }
+    if (hi - lo >= 12) {
+      int t = (lo + hi) / 2;
+      int bx0 = x1, bx1 = x0, by0 = y1, by1 = y0;
+      for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x)
+          if (lum(x, y) > t) {
+            bx0 = std::min(bx0, x); bx1 = std::max(bx1, x);
+            by0 = std::min(by0, y); by1 = std::max(by1, y);
+          }
+      if (bx1 > bx0 && by1 > by0) {
+        mask_.uvMin[0] = static_cast<float>(bx0) / w;
+        mask_.uvMin[1] = static_cast<float>(by0) / h;
+        mask_.uvMax[0] = static_cast<float>(bx1 + 1) / w;
+        mask_.uvMax[1] = static_cast<float>(by1 + 1) / h;
+        mask_.flipU = cux < 0;
+        mask_.flipV = cvy < 0;
+        // The mask is sampled from the sRGB base texture, so compare in linear.
+        mask_.threshold = std::pow(t / 255.0f, 2.2f);
+        mask_.texture = texture(tex, true, white_);
+        // The picture, not the whole glass, sets the video aspect and the TV's "size".
+        float metresPerU = 2 * screenHalfW_ / (uMax - uMin);
+        float metresPerV = 2 * screenHalfH_ / (vMax - vMin);
+        screenHalfW_ = (mask_.uvMax[0] - mask_.uvMin[0]) * metresPerU * 0.5f;
+        screenHalfH_ = (mask_.uvMax[1] - mask_.uvMin[1]) * metresPerV * 0.5f;
+        LOGI("screen mask: picture uv (%.3f,%.3f)-(%.3f,%.3f), flip %d/%d", mask_.uvMin[0],
+             mask_.uvMin[1], mask_.uvMax[0], mask_.uvMax[1], mask_.flipU, mask_.flipV);
+      }
+    }
+    stbi_image_free(px);
+    break;
+  }
 
   // 4. One vertex/index buffer; draws are index ranges.
   std::vector<float> allVerts;

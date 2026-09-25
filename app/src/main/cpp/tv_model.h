@@ -23,6 +23,17 @@ class TvModel {
   float screenHalfH() const { return screenHalfH_; }
   const std::vector<CrtButton>& buttons() const { return buttons_; }
 
+  // The screen texture usually has the tube's black mask painted in. These describe the lit
+  // picture area inside it, in the screen's UVs, and how to tell mask from picture.
+  struct ScreenMask {
+    GLuint texture = 0;          // 0: no mask, the video fills the whole glass
+    float uvMin[2] = {0, 0};     // picture area bounds in UV space
+    float uvMax[2] = {1, 1};
+    bool flipU = false, flipV = false;  // so video (0,0) is the bottom-left of the picture
+    float threshold = 0;         // linear luminance separating mask from picture
+  };
+  const ScreenMask& screenMask() const { return mask_; }
+
   // Everything except the screen, with the PBR program bound by the caller.
   void drawBody(GLuint program, const Mat4& model, uint32_t hoveredButtons,
                 uint32_t pressedButtons) const;
@@ -51,6 +62,7 @@ class TvModel {
   std::vector<Material> materials_;
   std::vector<Draw> draws_;
   std::vector<CrtButton> buttons_;
+  ScreenMask mask_;
   Vec3 boundsMin_, boundsMax_;
   float screenHalfW_ = 0, screenHalfH_ = 0;
 };

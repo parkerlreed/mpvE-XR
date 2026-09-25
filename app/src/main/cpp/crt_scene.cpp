@@ -112,25 +112,33 @@ uniform float uHasFrame;
 uniform vec3 uEye;
 uniform float uLines;
 uniform float uScanlineStrength;
+// Picture area within the glass UVs (min.xy, max.xy); the rest is the tube's painted mask.
+uniform vec4 uVideoRect;
+uniform vec2 uVideoFlip;
+uniform float uUseMask;
+uniform sampler2D uMask;
+uniform float uMaskThreshold;
 out vec4 fragColor;
 void main() {
   vec3 n = normalize(vNrm);
   if (!gl_FrontFacing) n = -n;
   vec3 v = normalize(uEye - vWorld);
 
-  vec2 tc = (uTexMatrix * vec4(vUv, 0.0, 1.0)).xy;
+  vec2 pic = (vUv - uVideoRect.xy) / (uVideoRect.zw - uVideoRect.xy);
+  pic = mix(pic, 1.0 - pic, uVideoFlip);
+  vec2 tc = (uTexMatrix * vec4(clamp(pic, 0.0, 1.0), 0.0, 1.0)).xy;
   // mpv writes display-referred sRGB; decode so the sRGB swapchain round-trips it unchanged.
   vec3 video = pow(texture(uTex, tc).rgb, vec3(2.2)) * uHasFrame;
 
   // Scanlines, faded out once they get close to pixel size to avoid moire.
-  float phase = vUv.y * uLines;
+  float phase = pic.y * uLines;
   float fw = fwidth(phase);
   float strength = uScanlineStrength * clamp(1.0 - (fw - 0.2) * 2.5, 0.0, 1.0);
   float line = 0.5 + 0.5 * cos(phase * 6.2831853);
   video *= mix(1.0, (0.55 + 0.45 * line) * 1.2, strength);
 
   // Tube falloff towards the corners.
-  vec2 d = vUv * 2.0 - 1.0;
+  vec2 d = pic * 2.0 - 1.0;
   video *= 1.0 - 0.22 * dot(d * d, vec2(1.0));
 
   // Dark glass with a soft fresnel sheen and a broad overhead highlight.
@@ -138,7 +146,14 @@ void main() {
   float fresnel = pow(1.0 - max(dot(n, v), 0.0), 4.0);
   vec3 l = normalize(vec3(0.3, 1.0, 0.5));
   float highlight = pow(max(dot(reflect(-l, n), v), 0.0), 60.0);
-  vec3 c = glass + video + vec3(0.02) * fresnel + vec3(0.05) * highlight;
+  // Keep the model's painted mask (with its rounded corners) over the edges of the picture.
+  float inside = 1.0;
+  vec3 maskColor = vec3(0.0);
+  if (uUseMask > 0.5) {
+    maskColor = texture(uMask, vUv).rgb;
+    inside = smoothstep(uMaskThreshold * 0.7, uMaskThreshold * 1.3, dot(maskColor, vec3(1.0 / 3.0)));
+  }
+  vec3 c = mix(maskColor, glass + video, inside) + vec3(0.02) * fresnel + vec3(0.05) * highlight;
   fragColor = vec4(c, 1.0);
 }
 )";
@@ -626,6 +641,18 @@ void CrtScene::draw(const Mat4& viewProj, Vec3 eye, const Pose& crtPose, float c
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
   glUniform1i(glGetUniformLocation(screenProgram_, "uTex"), 0);
+  const TvModel::ScreenMask noMask;
+  const TvModel::ScreenMask& mask = model_ ? model_->screenMask() : noMask;
+  glUniform4f(glGetUniformLocation(screenProgram_, "uVideoRect"), mask.uvMin[0], mask.uvMin[1],
+              mask.uvMax[0], mask.uvMax[1]);
+  glUniform2f(glGetUniformLocation(screenProgram_, "uVideoFlip"), mask.flipU ? 1.0f : 0.0f,
+              mask.flipV ? 1.0f : 0.0f);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uUseMask"), mask.texture ? 1.0f : 0.0f);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uMaskThreshold"), mask.threshold);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, mask.texture);
+  glUniform1i(glGetUniformLocation(screenProgram_, "uMask"), 1);
+  glActiveTexture(GL_TEXTURE0);
   if (model_) {
     model_->drawScreen();
   } else {
