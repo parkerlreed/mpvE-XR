@@ -112,12 +112,15 @@ uniform float uHasFrame;
 uniform vec3 uEye;
 uniform float uLines;
 uniform float uScanlineStrength;
-// Picture area within the glass UVs (min.xy, max.xy); the rest is the tube's painted mask.
+// Glass extent in its UVs (min.xy, max.xy); the video covers all of it.
 uniform vec4 uVideoRect;
 uniform vec2 uVideoFlip;
 uniform float uUseMask;
 uniform sampler2D uMask;
 uniform float uMaskThreshold;
+uniform sampler2D uOcclusion;
+uniform float uOcclusionStrength;
+uniform float uVignette;
 out vec4 fragColor;
 void main() {
   vec3 n = normalize(vNrm);
@@ -137,9 +140,11 @@ void main() {
   float line = 0.5 + 0.5 * cos(phase * 6.2831853);
   video *= mix(1.0, (0.55 + 0.45 * line) * 1.2, strength);
 
-  // Tube falloff towards the corners.
+  // Tube falloff towards the edges: the model's own occlusion if it has one, otherwise a vignette.
   vec2 d = pic * 2.0 - 1.0;
-  video *= 1.0 - 0.22 * dot(d * d, vec2(1.0));
+  video *= 1.0 - uVignette * dot(d * d, vec2(1.0));
+  float ao = mix(1.0, texture(uOcclusion, vUv).r, uOcclusionStrength);
+  video *= ao;
 
   // Dark glass with a soft fresnel sheen and a broad overhead highlight.
   vec3 glass = vec3(0.0015, 0.0018, 0.0016);
@@ -150,7 +155,7 @@ void main() {
   float inside = 1.0;
   vec3 maskColor = vec3(0.0);
   if (uUseMask > 0.5) {
-    maskColor = texture(uMask, vUv).rgb;
+    maskColor = texture(uMask, vUv).rgb * ao;
     inside = smoothstep(uMaskThreshold * 0.7, uMaskThreshold * 1.3, dot(maskColor, vec3(1.0 / 3.0)));
   }
   vec3 c = mix(maskColor, glass + video, inside) + vec3(0.02) * fresnel + vec3(0.05) * highlight;
@@ -649,9 +654,15 @@ void CrtScene::draw(const Mat4& viewProj, Vec3 eye, const Pose& crtPose, float c
               mask.flipV ? 1.0f : 0.0f);
   glUniform1f(glGetUniformLocation(screenProgram_, "uUseMask"), mask.texture ? 1.0f : 0.0f);
   glUniform1f(glGetUniformLocation(screenProgram_, "uMaskThreshold"), mask.threshold);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uOcclusionStrength"),
+              mask.occlusion ? mask.occlusionStrength : 0.0f);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uVignette"), model_ ? 0.0f : 0.22f);
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, mask.texture);
   glUniform1i(glGetUniformLocation(screenProgram_, "uMask"), 1);
+  glActiveTexture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, mask.occlusion);
+  glUniform1i(glGetUniformLocation(screenProgram_, "uOcclusion"), 2);
   glActiveTexture(GL_TEXTURE0);
   if (model_) {
     model_->drawScreen();

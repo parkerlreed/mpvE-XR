@@ -23,14 +23,16 @@ class TvModel {
   float screenHalfH() const { return screenHalfH_; }
   const std::vector<CrtButton>& buttons() const { return buttons_; }
 
-  // The screen texture usually has the tube's black mask painted in. These describe the lit
-  // picture area inside it, in the screen's UVs, and how to tell mask from picture.
+  // How the video sits on the glass: it covers the glass's whole UV extent (overscan), with the
+  // screen material's painted black surround and occlusion falloff composited over it.
   struct ScreenMask {
-    GLuint texture = 0;          // 0: no mask, the video fills the whole glass
-    float uvMin[2] = {0, 0};     // picture area bounds in UV space
+    GLuint texture = 0;          // painted surround (base colour); 0 for none
+    float uvMin[2] = {0, 0};     // glass bounds in UV space
     float uvMax[2] = {1, 1};
     bool flipU = false, flipV = false;  // so video (0,0) is the bottom-left of the picture
     float threshold = 0;         // linear luminance separating mask from picture
+    GLuint occlusion = 0;        // soft edge / corner falloff multiplied into the picture
+    float occlusionStrength = 0;
   };
   const ScreenMask& screenMask() const { return mask_; }
 
