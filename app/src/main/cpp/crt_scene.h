@@ -15,6 +15,7 @@ struct Mesh {
 
 struct ControllerVisual {
   bool active = false;
+  bool drawController = true;  // false for tracked hands, which passthrough already shows
   Pose aim;
   float rayLength = 0;  // 0 hides the ray
   bool highlighted = false;
@@ -62,12 +63,34 @@ class CrtScene {
   // Index of the front-panel button the ray points at, or -1.
   int buttonAt(const Pose& crtPose, float crtScale, Vec3 origin, Vec3 dir) const;
   const CrtButton& button(int index) const { return buttons_[index]; }
+  // Button whose face a fingertip is over, or -1. *depth is how far (world metres) the tip is
+  // pushed past the face: negative while still in front of it.
+  int buttonUnderPoint(const Pose& crtPose, float crtScale, Vec3 point, float* depth) const;
+  // True when a point is within `margin` metres in front of, or inside, the set.
+  bool nearFront(const Pose& crtPose, float crtScale, Vec3 point, float margin) const;
+
+  static constexpr int kMaxOccluders = 128;
+  // Punches passthrough-coloured holes where tracked hands are in front of the set, so the real
+  // hands stay visible. `spheres` holds xyz + radius per sphere, in world space.
+  void drawOccluders(const Mat4& viewProj, const float* spheres, int count);
+
+  // The runtime's skinned hand model, used as a closer-fitting occluder than spheres.
+  // `joints4`/`weights4` are four blend joints and weights per vertex.
+  static constexpr int kHandJoints = 26;
+  void setHandMesh(int hand, const float* positions, const float* normals, const int16_t* joints4,
+                   const float* weights4, int vertexCount, const int16_t* indices, int indexCount);
+  bool hasHandMesh(int hand) const { return handMeshes_[hand].count > 0; }
+  // `skin` holds one matrix per joint: current joint pose * inverse bind pose.
+  void drawHandMesh(int hand, const Mat4& viewProj, const Mat4* skin, float inflate);
   // Screen diagonal at scale 1, for the size presets.
   float screenDiagonalInches() const;
   float screenAspect() const { return screenHalfW_ / screenHalfH_; }
 
  private:
-  GLuint litProgram_ = 0, screenProgram_ = 0, pbrProgram_ = 0;
+  GLuint litProgram_ = 0, screenProgram_ = 0, pbrProgram_ = 0, occluderProgram_ = 0;
+  GLuint handProgram_ = 0;
+  Mesh sphere_;
+  Mesh handMeshes_[2];
   TvModel* model_ = nullptr;
   Vec3 boundsMin_ = kBoundsMin, boundsMax_ = kBoundsMax;
   float screenHalfW_ = kScreenHalfW, screenHalfH_ = kScreenHalfH;

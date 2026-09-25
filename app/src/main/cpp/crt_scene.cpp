@@ -272,6 +272,42 @@ void main() {
 }
 )";
 
+const char* kOccluderVs = R"(#version 300 es
+layout(location = 0) in vec3 aPos;
+uniform mat4 uViewProj;
+uniform vec4 uSpheres[128];
+void main() {
+  vec4 s = uSpheres[gl_InstanceID];
+  gl_Position = uViewProj * vec4(s.xyz + aPos * s.w, 1.0);
+}
+)";
+
+const char* kHandVs = R"(#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNrm;
+layout(location = 2) in vec4 aJoints;
+layout(location = 3) in vec4 aWeights;
+uniform mat4 uViewProj;
+uniform mat4 uSkin[26];
+uniform float uInflate;
+void main() {
+  ivec4 j = clamp(ivec4(aJoints), 0, 25);
+  mat4 m = uSkin[j.x] * aWeights.x + uSkin[j.y] * aWeights.y + uSkin[j.z] * aWeights.z +
+           uSkin[j.w] * aWeights.w;
+  vec3 p = (m * vec4(aPos, 1.0)).xyz;
+  vec3 n = normalize(mat3(m) * aNrm);
+  // Grow the hand a little so small tracking errors don't show slivers of the set over it.
+  gl_Position = uViewProj * vec4(p + n * uInflate, 1.0);
+}
+)";
+
+// Transparent black: the compositor shows passthrough here.
+const char* kOccluderFs = R"(#version 300 es
+precision mediump float;
+out vec4 fragColor;
+void main() { fragColor = vec4(0.0); }
+)";
+
 GLuint compile(GLenum type, const char* src) {
   GLuint s = glCreateShader(type);
   glShaderSource(s, 1, &src, nullptr);
@@ -513,6 +549,26 @@ Mesh buildScreen() {
   return b.upload();
 }
 
+Mesh buildUnitSphere() {
+  constexpr int rings = 8, segments = 12;
+  MeshBuilder b;
+  for (int r = 0; r <= rings; ++r) {
+    float phi = 3.14159265f * r / rings;
+    for (int s = 0; s <= segments; ++s) {
+      float theta = 6.2831853f * s / segments;
+      Vec3 p{std::sin(phi) * std::cos(theta), std::cos(phi), std::sin(phi) * std::sin(theta)};
+      b.vertex(p, p);
+    }
+  }
+  for (int r = 0; r < rings; ++r) {
+    for (int s = 0; s < segments; ++s) {
+      GLuint i0 = r * (segments + 1) + s, i1 = i0 + 1, i2 = i0 + segments + 1, i3 = i2 + 1;
+      b.indices.insert(b.indices.end(), {i0, i2, i1, i1, i2, i3});
+    }
+  }
+  return b.upload();
+}
+
 Mesh buildUnitBox() {
   MeshBuilder b;
   b.box({-0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, 0.5f});
@@ -537,8 +593,13 @@ bool CrtScene::init(const char* modelPath) {
   litProgram_ = link(kLitVs, kLitFs);
   screenProgram_ = link(kLitVs, kScreenFs);
   pbrProgram_ = link(kPbrVs, kPbrFs);
-  if (!litProgram_ || !screenProgram_ || !pbrProgram_) return false;
+  occluderProgram_ = link(kOccluderVs, kOccluderFs);
+  handProgram_ = link(kHandVs, kOccluderFs);
+  if (!litProgram_ || !screenProgram_ || !pbrProgram_ || !occluderProgram_ || !handProgram_) {
+    return false;
+  }
   box_ = buildUnitBox();
+  sphere_ = buildUnitSphere();
 
   if (modelPath && *modelPath) {
     model_ = new TvModel();
@@ -574,7 +635,10 @@ float CrtScene::screenDiagonalInches() const {
 }
 
 void CrtScene::destroy() {
-  for (Mesh* m : {&body_, &trim_, &slot_, &accent_, &led_, &screen_, &box_}) freeMesh(*m);
+  for (Mesh* m : {&body_, &trim_, &slot_, &accent_, &led_, &screen_, &box_, &sphere_,
+                  &handMeshes_[0], &handMeshes_[1]}) {
+    freeMesh(*m);
+  }
   for (int i = 0; i < kMaxButtons; ++i) {
     freeMesh(buttonBodies_[i]);
     freeMesh(buttonIcons_[i]);
@@ -587,7 +651,9 @@ void CrtScene::destroy() {
   if (litProgram_) glDeleteProgram(litProgram_);
   if (screenProgram_) glDeleteProgram(screenProgram_);
   if (pbrProgram_) glDeleteProgram(pbrProgram_);
-  litProgram_ = screenProgram_ = pbrProgram_ = 0;
+  if (occluderProgram_) glDeleteProgram(occluderProgram_);
+  if (handProgram_) glDeleteProgram(handProgram_);
+  litProgram_ = screenProgram_ = pbrProgram_ = occluderProgram_ = handProgram_ = 0;
 }
 
 void CrtScene::setVideo(GLuint externalTexture, const float* texMatrix, bool hasFrame) {
@@ -626,8 +692,10 @@ void CrtScene::draw(const Mat4& viewProj, Vec3 eye, const Pose& crtPose, float c
     const ControllerVisual& c = controllers[i];
     if (!c.active) continue;
     Mat4 aim = Mat4::fromPose(c.aim);
-    drawLit(box_, scaled(aim, {0.025f, 0.025f, 0.08f}, {0, 0, 0.03f}), viewProj, eye, kController,
-            0.0f, 0.3f);
+    if (c.drawController) {
+      drawLit(box_, scaled(aim, {0.025f, 0.025f, 0.08f}, {0, 0, 0.03f}), viewProj, eye,
+              kController, 0.0f, 0.3f);
+    }
     if (c.rayLength > 0) {
       drawLit(box_, scaled(aim, {0.002f, 0.002f, c.rayLength}, {0, 0, -c.rayLength * 0.5f}),
               viewProj, eye, c.highlighted ? kRayHit : kRay, 1.0f, 0.0f);
@@ -746,4 +814,97 @@ int CrtScene::buttonAt(const Pose& crtPose, float crtScale, Vec3 origin, Vec3 di
     }
   }
   return best;
+}
+
+int CrtScene::buttonUnderPoint(const Pose& crtPose, float crtScale, Vec3 point, float* depth) const {
+  Vec3 p = transformPoint(inverse(crtPose), point) * (1.0f / crtScale);
+  constexpr float pad = 0.003f;
+  int best = -1;
+  float bestDepth = -1e9f;
+  for (size_t i = 0; i < buttons_.size(); ++i) {
+    const CrtButton& b = buttons_[i];
+    if (std::fabs(p.x - b.cx) > b.hw + pad || std::fabs(p.y - b.cy) > b.hh + pad) continue;
+    // Only count a tip in front of the face or pushed a little way in, not one behind the panel.
+    if (p.z < b.z0 - 0.02f || p.z > b.z1 + 0.04f) continue;
+    float d = (b.z1 - p.z) * crtScale;
+    if (d > bestDepth) {
+      bestDepth = d;
+      best = static_cast<int>(i);
+    }
+  }
+  if (depth) *depth = bestDepth;
+  return best;
+}
+
+bool CrtScene::nearFront(const Pose& crtPose, float crtScale, Vec3 point, float margin) const {
+  Vec3 p = transformPoint(inverse(crtPose), point) * (1.0f / crtScale);
+  float m = margin / crtScale;
+  return p.x > boundsMin_.x - m && p.x < boundsMax_.x + m && p.y > boundsMin_.y - m &&
+         p.y < boundsMax_.y + m && p.z > boundsMin_.z && p.z < boundsMax_.z + m;
+}
+
+void CrtScene::drawOccluders(const Mat4& viewProj, const float* spheres, int count) {
+  if (count <= 0) return;
+  count = std::min(count, kMaxOccluders);
+  glUseProgram(occluderProgram_);
+  glUniformMatrix4fv(glGetUniformLocation(occluderProgram_, "uViewProj"), 1, GL_FALSE, viewProj.m);
+  glUniform4fv(glGetUniformLocation(occluderProgram_, "uSpheres"), count, spheres);
+  glBindVertexArray(sphere_.vao);
+  glDrawElementsInstanced(GL_TRIANGLES, sphere_.count, GL_UNSIGNED_INT, nullptr, count);
+  glBindVertexArray(0);
+}
+
+void CrtScene::setHandMesh(int hand, const float* positions, const float* normals,
+                           const int16_t* joints4, const float* weights4, int vertexCount,
+                           const int16_t* indices, int indexCount) {
+  freeMesh(handMeshes_[hand]);
+  if (vertexCount <= 0 || indexCount <= 0) return;
+  // pos3 nrm3 joints4 weights4
+  std::vector<float> verts(static_cast<size_t>(vertexCount) * 14);
+  for (int v = 0; v < vertexCount; ++v) {
+    float* f = &verts[static_cast<size_t>(v) * 14];
+    for (int k = 0; k < 3; ++k) {
+      f[k] = positions[v * 3 + k];
+      f[3 + k] = normals[v * 3 + k];
+    }
+    for (int k = 0; k < 4; ++k) {
+      f[6 + k] = static_cast<float>(joints4[v * 4 + k]);
+      f[10 + k] = weights4[v * 4 + k];
+    }
+  }
+  std::vector<GLuint> tris(indexCount);
+  for (int i = 0; i < indexCount; ++i) tris[i] = static_cast<uint16_t>(indices[i]);
+
+  Mesh& m = handMeshes_[hand];
+  glGenVertexArrays(1, &m.vao);
+  glGenBuffers(1, &m.vbo);
+  glGenBuffers(1, &m.ibo);
+  glBindVertexArray(m.vao);
+  glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
+  glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ibo);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, tris.size() * sizeof(GLuint), tris.data(), GL_STATIC_DRAW);
+  const GLsizei stride = 14 * sizeof(float);
+  const int sizes[] = {3, 3, 4, 4};
+  size_t offset = 0;
+  for (GLuint a = 0; a < 4; ++a) {
+    glEnableVertexAttribArray(a);
+    glVertexAttribPointer(a, sizes[a], GL_FLOAT, GL_FALSE, stride,
+                          reinterpret_cast<const void*>(offset * sizeof(float)));
+    offset += sizes[a];
+  }
+  glBindVertexArray(0);
+  m.count = static_cast<GLsizei>(tris.size());
+}
+
+void CrtScene::drawHandMesh(int hand, const Mat4& viewProj, const Mat4* skin, float inflate) {
+  const Mesh& m = handMeshes_[hand];
+  if (!m.count) return;
+  glUseProgram(handProgram_);
+  glUniformMatrix4fv(glGetUniformLocation(handProgram_, "uViewProj"), 1, GL_FALSE, viewProj.m);
+  glUniformMatrix4fv(glGetUniformLocation(handProgram_, "uSkin"), kHandJoints, GL_FALSE, skin[0].m);
+  glUniform1f(glGetUniformLocation(handProgram_, "uInflate"), inflate);
+  glBindVertexArray(m.vao);
+  glDrawElements(GL_TRIANGLES, m.count, GL_UNSIGNED_INT, nullptr);
+  glBindVertexArray(0);
 }

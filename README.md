@@ -10,6 +10,7 @@ headset switches to the immersive CRT player.
 - mpv renders straight onto the TV's curved glass, using all your usual mpv/mpvEx settings
 - Grab, push/pull, spin and resize the TV; its position is remembered between sessions
 - Pressable buttons on the set, plus controller shortcuts
+- Hand tracking: pinch laser, or poke the buttons with your finger
 - Built-in TV/VCR combo, or drop in a realistic glTF model (see below)
 - On phones and tablets the app behaves like normal mpvEx
 
@@ -68,7 +69,20 @@ mapping below is specific to this model.
 | Left stick up/down | Volume |
 | Left **menu** button | Back to the browser |
 
-Point at a button on the set and pull the trigger to press it:
+### Hand tracking
+
+Put the controllers down and hands take over (turn on hand tracking in the Quest settings). Your
+real hands stay visible in front of the TV.
+
+| Gesture | Action |
+|---|---|
+| Quick pinch while pointing at the TV | Play / pause |
+| Pinch and hold (or pinch and move) on the TV | Grab it; let go to drop it |
+| Pinch on a button | Press it |
+| Poke a button with your index finger | Press it (reach within ~12 cm of the set) |
+| Left palm-up menu gesture | Bring the TV back in front of you |
+
+Point at a button on the set and pull the trigger (or pinch, or poke it) to press it:
 
 | Built-in TV/VCR | Sketchfab CRT TV | Action |
 |---|---|---|

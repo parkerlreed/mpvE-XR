@@ -154,6 +154,23 @@ struct Hand {
   float buttonRepeat = 0;
   int stickDir = 0;  // 0 none, 1 right, 2 left, 3 up, 4 down
   float stickRepeat = 0;
+
+  // Hand tracking, used when this side's controller isn't active.
+  XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+  bool tracked = false;
+  XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT] = {};
+  bool aimValid = false;       // Meta's hand "aim" ray is usable this frame
+  float pinch = 0;             // index pinch strength, 0..1
+  bool menuGesture = false;    // system menu gesture started this frame
+  bool menuGestureDown = false;
+  bool pinchDown = false;
+  bool pinchOnSet = false;     // pinch began on the set body: a tap or the start of a grab
+  float pinchHeld = 0;
+  Vec3 pinchStart;
+  bool nearSet = false;        // fingertip close enough to the set to poke instead of point
+  int pokeButton = -1;
+  bool pokeArmed = false;      // tip was in front of a button face, so pushing in counts
+  std::vector<Pose> bindPoses;  // hand mesh bind pose per joint, when the runtime provides one
 };
 
 class XrApp {
@@ -202,6 +219,14 @@ class XrApp {
   PFN_xrCreatePassthroughLayerFB xrCreatePassthroughLayerFB_ = nullptr;
   PFN_xrDestroyPassthroughLayerFB xrDestroyPassthroughLayerFB_ = nullptr;
 
+  bool handTrackingSupported_ = false;
+  bool handAimSupported_ = false;
+  bool handMeshSupported_ = false;
+  PFN_xrGetHandMeshFB xrGetHandMeshFB_ = nullptr;
+  PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT_ = nullptr;
+  PFN_xrDestroyHandTrackerEXT xrDestroyHandTrackerEXT_ = nullptr;
+  PFN_xrLocateHandJointsEXT xrLocateHandJointsEXT_ = nullptr;
+
   // Scene
   CrtScene scene_;
   GLuint videoTexture_ = 0;
@@ -219,12 +244,21 @@ class XrApp {
   bool initSwapchains();
   bool initActions();
   void initPassthrough();
+  void initHandTracking();
   void shutdown();
 
   void pollEvents(bool& quit);
   void frame();
   void updateInput(XrTime time, float dt);
   void updateHand(int h, float dt);
+  void updateTrackedHand(int h, float dt);
+  void locateHand(int h, XrTime time);
+  void startGrab(int h);
+  void endGrab(int h);
+  void pressButton(int h, int button);
+  void repeatHeldButton(int h, float dt);
+  int collectOccluders(int h, float* spheres, int max) const;
+  void loadHandMesh(int h);
   void placeInFront();
   void haptic(int h, float amplitude);
   void renderEye(int eye, const XrView& view, uint32_t imageIndex);
@@ -303,6 +337,12 @@ bool XrApp::initInstance(JNIEnv* env, jobject activity) {
   }
   passthroughSupported_ = has(XR_FB_PASSTHROUGH_EXTENSION_NAME);
   if (passthroughSupported_) extensions.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
+  handTrackingSupported_ = has(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+  if (handTrackingSupported_) extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+  handAimSupported_ = handTrackingSupported_ && has(XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME);
+  if (handAimSupported_) extensions.push_back(XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME);
+  handMeshSupported_ = handTrackingSupported_ && has(XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME);
+  if (handMeshSupported_) extensions.push_back(XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME);
 
   XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
   androidInfo.applicationVM = vm;
@@ -339,7 +379,25 @@ bool XrApp::initInstance(JNIEnv* env, jobject activity) {
     passthroughSupported_ = xrCreatePassthroughFB_ && xrDestroyPassthroughFB_ &&
                             xrCreatePassthroughLayerFB_ && xrDestroyPassthroughLayerFB_;
   }
-  LOGI("OpenXR instance ready, passthrough %s", passthroughSupported_ ? "available" : "missing");
+  if (handTrackingSupported_) {
+    XrSystemHandTrackingPropertiesEXT handProps{XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+    XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES};
+    props.next = &handProps;
+    xrGetSystemProperties(instance_, system_, &props);
+    auto load = [&](const char* name, auto& fn) {
+      xrGetInstanceProcAddr(instance_, name, reinterpret_cast<PFN_xrVoidFunction*>(&fn));
+    };
+    load("xrCreateHandTrackerEXT", xrCreateHandTrackerEXT_);
+    load("xrDestroyHandTrackerEXT", xrDestroyHandTrackerEXT_);
+    load("xrLocateHandJointsEXT", xrLocateHandJointsEXT_);
+    if (handMeshSupported_) load("xrGetHandMeshFB", xrGetHandMeshFB_);
+    handMeshSupported_ = handMeshSupported_ && xrGetHandMeshFB_;
+    handTrackingSupported_ = handProps.supportsHandTracking && xrCreateHandTrackerEXT_ &&
+                             xrDestroyHandTrackerEXT_ && xrLocateHandJointsEXT_;
+  }
+  LOGI("OpenXR instance ready, passthrough %s, hand tracking %s (aim %s, mesh %s)",
+       passthroughSupported_ ? "available" : "missing", handTrackingSupported_ ? "yes" : "no",
+       handAimSupported_ ? "yes" : "no", handMeshSupported_ ? "yes" : "no");
   return true;
 }
 
@@ -523,7 +581,70 @@ void XrApp::initPassthrough() {
   }
 }
 
+void XrApp::initHandTracking() {
+  if (!handTrackingSupported_) return;
+  const XrHandEXT sides[2] = {XR_HAND_LEFT_EXT, XR_HAND_RIGHT_EXT};
+  for (int h = 0; h < 2; ++h) {
+    XrHandTrackerCreateInfoEXT info{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+    info.hand = sides[h];
+    info.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+    if (XR_FAILED(xrCreateHandTrackerEXT_(session_, &info, &hands_[h].tracker))) {
+      LOGE("xrCreateHandTrackerEXT failed");
+      hands_[h].tracker = XR_NULL_HANDLE;
+      continue;
+    }
+    loadHandMesh(h);
+  }
+}
+
+void XrApp::loadHandMesh(int h) {
+  Hand& hand = hands_[h];
+  if (!handMeshSupported_ || !hand.tracker) return;
+  XrHandTrackingMeshFB mesh{XR_TYPE_HAND_TRACKING_MESH_FB};
+  if (XR_FAILED(xrGetHandMeshFB_(hand.tracker, &mesh))) return;
+  if (mesh.jointCountOutput != CrtScene::kHandJoints) {
+    LOGE("hand mesh has %u joints, expected %d", mesh.jointCountOutput, CrtScene::kHandJoints);
+    return;
+  }
+  std::vector<XrPosef> bind(mesh.jointCountOutput);
+  std::vector<float> radii(mesh.jointCountOutput);
+  std::vector<XrHandJointEXT> parents(mesh.jointCountOutput);
+  std::vector<XrVector3f> positions(mesh.vertexCountOutput), normals(mesh.vertexCountOutput);
+  std::vector<XrVector2f> uvs(mesh.vertexCountOutput);
+  std::vector<XrVector4sFB> joints(mesh.vertexCountOutput);
+  std::vector<XrVector4f> weights(mesh.vertexCountOutput);
+  std::vector<int16_t> indices(mesh.indexCountOutput);
+  mesh.jointCapacityInput = mesh.jointCountOutput;
+  mesh.jointBindPoses = bind.data();
+  mesh.jointRadii = radii.data();
+  mesh.jointParents = parents.data();
+  mesh.vertexCapacityInput = mesh.vertexCountOutput;
+  mesh.vertexPositions = positions.data();
+  mesh.vertexNormals = normals.data();
+  mesh.vertexUVs = uvs.data();
+  mesh.vertexBlendIndices = joints.data();
+  mesh.vertexBlendWeights = weights.data();
+  mesh.indexCapacityInput = mesh.indexCountOutput;
+  mesh.indices = indices.data();
+  if (XR_FAILED(xrGetHandMeshFB_(hand.tracker, &mesh))) return;
+
+  hand.bindPoses.clear();
+  for (const XrPosef& p : bind) hand.bindPoses.push_back(fromXr(p));
+  static_assert(sizeof(XrVector3f) == 3 * sizeof(float), "packed");
+  static_assert(sizeof(XrVector4sFB) == 4 * sizeof(int16_t), "packed");
+  static_assert(sizeof(XrVector4f) == 4 * sizeof(float), "packed");
+  scene_.setHandMesh(h, &positions[0].x, &normals[0].x, &joints[0].x, &weights[0].x,
+                     static_cast<int>(mesh.vertexCountOutput), indices.data(),
+                     static_cast<int>(mesh.indexCountOutput));
+  LOGI("hand %d mesh: %u vertices, %u triangles", h, mesh.vertexCountOutput,
+       mesh.indexCountOutput / 3);
+}
+
 void XrApp::shutdown() {
+  for (Hand& hand : hands_) {
+    if (hand.tracker) xrDestroyHandTrackerEXT_(hand.tracker);
+    hand.tracker = XR_NULL_HANDLE;
+  }
   for (EyeTarget& eye : eyes_) {
     if (eye.fbo) glDeleteFramebuffers(1, &eye.fbo);
     if (eye.depth) glDeleteRenderbuffers(1, &eye.depth);
@@ -668,7 +789,237 @@ void XrApp::updateInput(XrTime time, float dt) {
     hand.menuPressed = pressed(menuAction_);
   }
 
+  for (int h = 0; h < 2; ++h) {
+    if (focused && !hands_[h].active) {
+      locateHand(h, time);
+    } else {
+      hands_[h].tracked = false;
+    }
+  }
+
   for (int h = 0; h < 2; ++h) updateHand(h, dt);
+}
+
+void XrApp::locateHand(int h, XrTime time) {
+  Hand& hand = hands_[h];
+  hand.tracked = false;
+  hand.aimValid = false;
+  hand.menuGesture = false;
+  if (!hand.tracker) return;
+
+  XrHandTrackingAimStateFB aim{XR_TYPE_HAND_TRACKING_AIM_STATE_FB};
+  XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+  locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+  locations.jointLocations = hand.joints;
+  if (handAimSupported_) locations.next = &aim;
+  XrHandJointsLocateInfoEXT info{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+  info.baseSpace = appSpace_;
+  info.time = time;
+  if (XR_FAILED(xrLocateHandJointsEXT_(hand.tracker, &info, &locations)) || !locations.isActive) {
+    return;
+  }
+  hand.tracked = true;
+
+  if (handAimSupported_ && (aim.status & XR_HAND_TRACKING_AIM_VALID_BIT_FB)) {
+    hand.aimValid = true;
+    hand.aim = fromXr(aim.aimPose);
+    hand.pinch = aim.pinchStrengthIndex;
+  } else {
+    // No aim extension: point along the index finger and pinch by thumb-index distance.
+    const XrPosef& palm = hand.joints[XR_HAND_JOINT_PALM_EXT].pose;
+    const XrVector3f& t = hand.joints[XR_HAND_JOINT_THUMB_TIP_EXT].pose.position;
+    const XrVector3f& i = hand.joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
+    hand.aimValid = hand.joints[XR_HAND_JOINT_PALM_EXT].locationFlags &
+                    XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    hand.aim = fromXr(palm);
+    float gap = length(Vec3{t.x - i.x, t.y - i.y, t.z - i.z});
+    hand.pinch = std::clamp(1.0f - (gap - 0.01f) / 0.03f, 0.0f, 1.0f);
+  }
+  bool menu = handAimSupported_ && (aim.status & XR_HAND_TRACKING_AIM_MENU_PRESSED_BIT_FB);
+  hand.menuGesture = menu && !hand.menuGestureDown;
+  hand.menuGestureDown = menu;
+}
+
+void XrApp::startGrab(int h) {
+  Hand& hand = hands_[h];
+  hand.grabbing = true;
+  hand.pressedButton = -1;
+  hand.grabOffset = inverse(hand.aim) * crtPose_;
+  hand.grabYaw = 0;
+  haptic(h, 0.5f);
+}
+
+void XrApp::endGrab(int h) {
+  hands_[h].grabbing = false;
+  haptic(h, 0.25f);
+  bridge_.crtPoseChanged(crtPose_, crtScale_);
+}
+
+void XrApp::pressButton(int h, int button) {
+  Hand& hand = hands_[h];
+  hand.pressedButton = button;
+  hand.buttonRepeat = 0.45f;
+  haptic(h, 0.3f);
+  bridge_.action(scene_.button(button).action);
+}
+
+void XrApp::repeatHeldButton(int h, float dt) {
+  // Holding rewind / fast-forward / volume keeps going while still on the button.
+  Hand& hand = hands_[h];
+  const CrtButton& held = scene_.button(hand.pressedButton);
+  if (!held.repeats || hand.hoverButton != hand.pressedButton) return;
+  hand.buttonRepeat -= dt;
+  if (hand.buttonRepeat <= 0) {
+    hand.buttonRepeat = 0.3f;
+    bridge_.action(held.action);
+  }
+}
+
+void XrApp::updateTrackedHand(int h, float dt) {
+  Hand& hand = hands_[h];
+  Hand& other = hands_[1 - h];
+
+  // Poke: the index fingertip presses the set's buttons directly.
+  const XrHandJointLocationEXT& tipJoint = hand.joints[XR_HAND_JOINT_INDEX_TIP_EXT];
+  bool tipValid = tipJoint.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT;
+  Vec3 tip{tipJoint.pose.position.x, tipJoint.pose.position.y, tipJoint.pose.position.z};
+  hand.nearSet = !hand.grabbing && tipValid && scene_.nearFront(crtPose_, crtScale_, tip, 0.12f);
+
+  if (hand.nearSet) {
+    // Leaving laser mode mid-pinch shouldn't leave a pending tap or held button behind.
+    if (hand.pinchDown && hand.pressedButton >= 0 && hand.pokeButton < 0) hand.pressedButton = -1;
+    hand.pinchDown = hand.pinchOnSet = false;
+
+    float depth = 0;
+    int b = scene_.buttonUnderPoint(crtPose_, crtScale_, tip, &depth);
+    if (b >= 0 && depth > -0.03f) hand.hoverButton = b;
+    if (hand.pokeButton >= 0) {
+      // Release once the finger backs off the face or slides off the button.
+      if (b != hand.pokeButton || depth < -0.004f) {
+        hand.pokeButton = -1;
+        hand.pressedButton = -1;
+      } else {
+        repeatHeldButton(h, dt);
+      }
+    } else if (b >= 0 && depth > 0 && hand.pokeArmed) {
+      hand.pokeButton = b;
+      pressButton(h, b);
+    }
+    // Only a press that starts in front of the face counts, so sliding sideways onto a button
+    // while already pushed into the panel does nothing.
+    if (b < 0) {
+      hand.pokeArmed = false;
+    } else if (depth < -0.002f) {
+      hand.pokeArmed = true;
+    }
+    return;
+  }
+  if (hand.pokeButton >= 0) {
+    hand.pokeButton = -1;
+    hand.pressedButton = -1;
+  }
+  hand.pokeArmed = false;
+
+  if (hand.menuGesture) placeInFront();
+
+  // Laser: pinch acts like the trigger, and a held pinch on the set grabs it.
+  if (!hand.aimValid) {
+    if (hand.grabbing) endGrab(h);
+    hand.pinchDown = hand.pinchOnSet = false;
+    hand.pressedButton = -1;
+    return;
+  }
+  Vec3 origin = hand.aim.p;
+  Vec3 dir = rotate(hand.aim.q, {0, 0, -1});
+  float hit = scene_.rayHit(crtPose_, crtScale_, origin, dir);
+  bool pointing = hit >= 0.0f && hit < 20.0f;
+  if (pointing && !hand.grabbing) hand.hoverButton = scene_.buttonAt(crtPose_, crtScale_, origin, dir);
+
+  bool pinchDown = hand.pinch > 0.85f || (hand.pinchDown && hand.pinch > 0.6f);
+  if (pinchDown && !hand.pinchDown) {
+    if (hand.hoverButton >= 0) {
+      pressButton(h, hand.hoverButton);
+    } else if (pointing) {
+      hand.pinchOnSet = true;
+      hand.pinchHeld = 0;
+      hand.pinchStart = origin;
+    }
+  } else if (pinchDown) {
+    if (hand.pressedButton >= 0) repeatHeldButton(h, dt);
+    if (hand.pinchOnSet && !hand.grabbing && !other.grabbing) {
+      hand.pinchHeld += dt;
+      if (hand.pinchHeld > 0.35f || length(origin - hand.pinchStart) > 0.03f) startGrab(h);
+    }
+  } else if (hand.pinchDown) {
+    if (hand.grabbing) {
+      endGrab(h);
+    } else if (hand.pinchOnSet) {
+      bridge_.action(kTogglePause);
+    }
+    hand.pinchOnSet = false;
+    hand.pressedButton = -1;
+  }
+  hand.pinchDown = pinchDown;
+
+  if (hand.grabbing) {
+    Pose held = hand.aim * hand.grabOffset;
+    crtPose_.p = held.p;
+    crtPose_.q = axisAngle({0, 1, 0}, yawOf(held.q));
+  }
+}
+
+int XrApp::collectOccluders(int h, float* spheres, int max) const {
+  // Spheres along every finger bone, slightly inflated to cover tracking error.
+  static const int kChains[][6] = {
+      {XR_HAND_JOINT_WRIST_EXT, XR_HAND_JOINT_THUMB_METACARPAL_EXT, XR_HAND_JOINT_THUMB_PROXIMAL_EXT,
+       XR_HAND_JOINT_THUMB_DISTAL_EXT, XR_HAND_JOINT_THUMB_TIP_EXT, -1},
+      {XR_HAND_JOINT_WRIST_EXT, XR_HAND_JOINT_INDEX_PROXIMAL_EXT, XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT,
+       XR_HAND_JOINT_INDEX_DISTAL_EXT, XR_HAND_JOINT_INDEX_TIP_EXT, -1},
+      {XR_HAND_JOINT_WRIST_EXT, XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT, XR_HAND_JOINT_MIDDLE_INTERMEDIATE_EXT,
+       XR_HAND_JOINT_MIDDLE_DISTAL_EXT, XR_HAND_JOINT_MIDDLE_TIP_EXT, -1},
+      {XR_HAND_JOINT_WRIST_EXT, XR_HAND_JOINT_RING_PROXIMAL_EXT, XR_HAND_JOINT_RING_INTERMEDIATE_EXT,
+       XR_HAND_JOINT_RING_DISTAL_EXT, XR_HAND_JOINT_RING_TIP_EXT, -1},
+      {XR_HAND_JOINT_WRIST_EXT, XR_HAND_JOINT_LITTLE_PROXIMAL_EXT, XR_HAND_JOINT_LITTLE_INTERMEDIATE_EXT,
+       XR_HAND_JOINT_LITTLE_DISTAL_EXT, XR_HAND_JOINT_LITTLE_TIP_EXT, -1},
+  };
+  int n = 0;
+  auto add = [&](Vec3 p, float r) {
+    if (n >= max) return;
+    spheres[n * 4] = p.x;
+    spheres[n * 4 + 1] = p.y;
+    spheres[n * 4 + 2] = p.z;
+    spheres[n * 4 + 3] = r;
+    ++n;
+  };
+  {
+    const Hand& hand = hands_[h];
+    if (!hand.tracked) return 0;
+    auto joint = [&](int j, Vec3* p, float* r) {
+      const XrHandJointLocationEXT& l = hand.joints[j];
+      if (!(l.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) return false;
+      *p = {l.pose.position.x, l.pose.position.y, l.pose.position.z};
+      *r = std::max(l.radius, 0.006f) * 1.25f + 0.003f;
+      return true;
+    };
+    Vec3 palm;
+    float palmR;
+    if (joint(XR_HAND_JOINT_PALM_EXT, &palm, &palmR)) add(palm, std::max(palmR, 0.035f));
+    for (const auto& chain : kChains) {
+      for (int k = 0; chain[k + 1] >= 0; ++k) {
+        Vec3 a, b;
+        float ra, rb;
+        if (!joint(chain[k], &a, &ra) || !joint(chain[k + 1], &b, &rb)) continue;
+        // Enough spheres along the bone that neighbours overlap.
+        int steps = std::clamp(static_cast<int>(length(b - a) / (std::min(ra, rb) * 1.2f)), 1, 6);
+        for (int s = 0; s < steps; ++s) {
+          float t = static_cast<float>(s) / steps;
+          add(a + (b - a) * t, ra + (rb - ra) * t);
+        }
+        if (chain[k + 2] < 0) add(b, rb);
+      }
+    }
+  }
+  return n;
 }
 
 void XrApp::updateHand(int h, float dt) {
@@ -676,7 +1027,13 @@ void XrApp::updateHand(int h, float dt) {
   Hand& other = hands_[1 - h];
   hand.hoverButton = -1;
   if (!hand.active) {
+    if (hand.tracked) {
+      updateTrackedHand(h, dt);
+      return;
+    }
     hand.pressedButton = -1;
+    hand.pokeButton = -1;
+    hand.pinchDown = hand.pinchOnSet = false;
     if (hand.grabbing) {
       hand.grabbing = false;
       bridge_.crtPoseChanged(crtPose_, crtScale_);
@@ -820,9 +1177,12 @@ void XrApp::renderEye(int eyeIndex, const XrView& view, uint32_t imageIndex) {
   ControllerVisual visuals[2];
   for (int h = 0; h < 2; ++h) {
     const Hand& hand = hands_[h];
-    visuals[h].active = hand.active;
+    // Tracked hands get a laser but no controller model, and no laser while poking.
+    bool laser = hand.active || (hand.tracked && hand.aimValid && !hand.nearSet);
+    visuals[h].active = laser;
+    visuals[h].drawController = hand.active;
     visuals[h].aim = hand.aim;
-    if (hand.active) {
+    if (laser) {
       Vec3 dir = rotate(hand.aim.q, {0, 0, -1});
       float hit = scene_.rayHit(crtPose_, crtScale_, hand.aim.p, dir);
       visuals[h].highlighted = hand.grabbing || (hit >= 0 && hit < 20.0f);
@@ -831,6 +1191,32 @@ void XrApp::renderEye(int eyeIndex, const XrView& view, uint32_t imageIndex) {
   }
 
   scene_.draw(viewProj, eyePose.p, crtPose_, crtScale_, visuals, 2);
+
+  if (passthroughLayer_) {
+    for (int h = 0; h < 2; ++h) {
+      const Hand& hand = hands_[h];
+      if (!hand.tracked) continue;
+      // Prefer the runtime's skinned hand model; fall back to spheres along the bones.
+      bool skinned = scene_.hasHandMesh(h) && hand.bindPoses.size() == CrtScene::kHandJoints;
+      Mat4 skin[CrtScene::kHandJoints];
+      for (int j = 0; skinned && j < CrtScene::kHandJoints; ++j) {
+        const XrHandJointLocationEXT& l = hand.joints[j];
+        if (!(l.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
+            !(l.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+          skinned = false;
+          break;
+        }
+        skin[j] = Mat4::fromPose(fromXr(l.pose) * inverse(hand.bindPoses[j]));
+      }
+      if (skinned) {
+        scene_.drawHandMesh(h, viewProj, skin, 0.004f);
+      } else {
+        float spheres[CrtScene::kMaxOccluders * 4];
+        int count = collectOccluders(h, spheres, CrtScene::kMaxOccluders);
+        scene_.drawOccluders(viewProj, spheres, count);
+      }
+    }
+  }
 
   const GLenum discard = GL_DEPTH_ATTACHMENT;
   glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &discard);
@@ -934,6 +1320,7 @@ bool XrApp::run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initi
     return false;
   }
   initPassthrough();
+  initHandTracking();
 
   if (initialPose && env->GetArrayLength(initialPose) == 8 && stageSpace_) {
     float v[8];
