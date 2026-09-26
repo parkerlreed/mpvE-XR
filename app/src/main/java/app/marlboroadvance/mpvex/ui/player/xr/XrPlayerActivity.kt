@@ -92,6 +92,18 @@ class XrPlayerActivity : ComponentActivity() {
   @Volatile private var playing = false
   @Volatile private var pendingPath: String? = null
 
+  // Headset settings panel, opened with the left menu button; used on the render thread.
+  private lateinit var panel: XrPanel
+  private lateinit var surroundings: XrPanel.Row
+  private lateinit var dimming: XrPanel.Row
+  private lateinit var saturation: XrPanel.Row
+  private lateinit var padding: XrPanel.Row
+  private lateinit var scanlines: XrPanel.Row
+  private lateinit var scanlineFade: XrPanel.Row
+  private lateinit var reflections: XrPanel.Row
+  private lateinit var reach: XrPanel.Row
+  private lateinit var customModel: XrPanel.Row
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -119,10 +131,9 @@ class XrPlayerActivity : ComponentActivity() {
     setUpFromIntent(intent)
     pendingPath = path
 
+    buildPanel()
     renderThread = thread(name = "mpvEx-XR") {
-      val model = XrSupport.customModelFile(this)
-        ?.takeIf { xrPreferences.useCustomModel.get() && it.isFile }
-      val ok = XrNative.run(this, bridge, XrSupport.loadTvPose(this), model?.path, nativeSettings())
+      val ok = XrNative.run(this, bridge, XrSupport.loadTvPose(this), modelPath(), nativeSettings())
       if (!ok) runOnUiThread { fallBackTo2d() }
     }
   }
@@ -279,9 +290,7 @@ class XrPlayerActivity : ComponentActivity() {
 
   private val bridge = object : XrBridge {
     override fun onGlReady(texture: Int, screenAspect: Float) {
-      // Match the glass so mpv letterboxes against the real screen shape; keep the width even.
-      val height = xrPreferences.videoHeight.get().takeIf { it in XrPreferences.VIDEO_HEIGHTS } ?: 1080
-      val width = ((height * screenAspect).toInt() / 2 * 2).coerceIn(height, height * 2)
+      val (width, height) = videoSize(screenAspect)
       val st = SurfaceTexture(texture).apply {
         setDefaultBufferSize(width, height)
         setOnFrameAvailableListener({ frameAvailable.set(true) }, Handler(Looper.getMainLooper()))
@@ -316,6 +325,16 @@ class XrPlayerActivity : ComponentActivity() {
 
     override fun onCrtPoseChanged(pose: FloatArray) {
       XrSupport.saveTvPose(this@XrPlayerActivity, pose)
+    }
+
+    override fun updatePanel(texture: Int): Boolean = panel.upload(texture)
+
+    override fun onPanelTouch(x: Float, y: Float, down: Boolean): Int = panel.touch(x, y, down)
+
+    override fun onScreenAspect(screenAspect: Float) {
+      val (width, height) = videoSize(screenAspect)
+      surfaceTexture?.setDefaultBufferSize(width, height)
+      MPVLib.setPropertyString("android-surface-size", "${width}x$height")
     }
 
     override fun onSessionEnded() {
@@ -478,6 +497,78 @@ class XrPlayerActivity : ComponentActivity() {
     }
   }
 
+  // Match the glass so mpv letterboxes against the real screen shape; keep the width even.
+  private fun videoSize(screenAspect: Float): Pair<Int, Int> {
+    val height = xrPreferences.videoHeight.get().takeIf { it in XrPreferences.VIDEO_HEIGHTS } ?: 1080
+    val width = ((height * screenAspect).toInt() / 2 * 2).coerceIn(height, height * 2)
+    return width to height
+  }
+
+  private fun modelPath(): String? =
+    XrSupport.customModelFile(this)?.takeIf { xrPreferences.useCustomModel.get() && it.isFile }?.path
+
+  private fun buildPanel() {
+    val p = xrPreferences
+    fun Boolean.toInt() = if (this) 1 else 0
+    surroundings = XrPanel.choice(
+      getString(R.string.pref_vr_surroundings),
+      getString(R.string.pref_vr_surroundings_passthrough),
+      getString(R.string.pref_vr_surroundings_dark_room),
+    ).apply { value = p.surroundings.get() }
+    dimming = XrPanel.slider(getString(R.string.pref_vr_room_dimming), 0, 95, 5, "%")
+      .apply { value = p.roomDimming.get() }
+    saturation = XrPanel.slider(getString(R.string.pref_vr_room_saturation), 0, 100, 5, "%")
+      .apply { value = p.roomSaturation.get() }
+    padding = XrPanel.slider(getString(R.string.xr_panel_hand_padding), 0, 15, 1, " mm")
+      .apply { value = p.handOcclusionPaddingMm.get() }
+    scanlines = XrPanel.slider(getString(R.string.pref_vr_scanlines), 0, 100, 5, "%")
+      .apply { value = p.scanlines.get() }
+    scanlineFade = XrPanel.toggle(getString(R.string.pref_vr_scanlines_fade))
+      .apply { value = p.scanlinesFadeWithDistance.get().toInt() }
+    reflections = XrPanel.slider(getString(R.string.pref_vr_glass_reflections), 0, 100, 5, "%")
+      .apply { value = p.glassReflections.get() }
+    reach = XrPanel.slider(getString(R.string.pref_vr_reach_distance), 40, 100, 5, " cm")
+      .apply { value = p.reachDistanceCm.get() }
+    customModel = XrPanel.toggle(getString(R.string.xr_panel_custom_model, XrSupport.MODEL_FILE_NAME))
+      .apply { value = p.useCustomModel.get().toInt() }
+    panel = XrPanel(
+      getString(R.string.xr_panel_title),
+      ::onPanelSettingChanged,
+      surroundings, dimming, saturation, padding, scanlines, scanlineFade, reflections, reach,
+      customModel,
+      XrPanel.commands(
+        getString(R.string.xr_panel_tv_size), XrPanel.CMD_SIZE_FIRST,
+        "14\u2033", "20\u2033", "27\u2033", "32\u2033", "40\u2033",
+      ),
+      XrPanel.commands("", XrPanel.CMD_RECENTER, getString(R.string.xr_panel_recenter)),
+    )
+    updatePanelEnabled()
+  }
+
+  private fun updatePanelEnabled() {
+    val passthrough = surroundings.value == 0
+    dimming.enabled = passthrough
+    saturation.enabled = passthrough
+    padding.enabled = passthrough
+    customModel.enabled = XrSupport.customModelFile(this)?.isFile == true
+    panel.invalidate()
+  }
+
+  private fun onPanelSettingChanged(row: XrPanel.Row) {
+    val p = xrPreferences
+    p.surroundings.set(surroundings.value)
+    p.roomDimming.set(dimming.value)
+    p.roomSaturation.set(saturation.value)
+    p.handOcclusionPaddingMm.set(padding.value)
+    p.scanlines.set(scanlines.value)
+    p.scanlinesFadeWithDistance.set(scanlineFade.on())
+    p.glassReflections.set(reflections.value)
+    p.reachDistanceCm.set(reach.value)
+    p.useCustomModel.set(customModel.on())
+    updatePanelEnabled()
+    if (row === customModel) XrNative.setModel(modelPath()) else XrNative.setSettings(nativeSettings())
+  }
+
   /** Mirrors XrSettings in xr_app.cpp; order matters. */
   private fun nativeSettings(): FloatArray =
     floatArrayOf(
@@ -488,6 +579,7 @@ class XrPlayerActivity : ComponentActivity() {
       if (xrPreferences.scanlinesFadeWithDistance.get()) 1f else 0f,
       xrPreferences.glassReflections.get().coerceIn(0, 100) / 100f,
       xrPreferences.reachDistanceCm.get() / 100f,
+      xrPreferences.surroundings.get().toFloat(),
     )
 
   companion object {

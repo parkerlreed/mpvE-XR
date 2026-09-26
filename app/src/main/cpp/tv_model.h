@@ -21,6 +21,10 @@ class TvModel {
   Vec3 boundsMax() const { return boundsMax_; }
   float screenHalfW() const { return screenHalfW_; }
   float screenHalfH() const { return screenHalfH_; }
+  // Centre of the picture on the glass; the glass itself is centred on the origin.
+  Vec3 pictureCentre() const { return pictureCentre_; }
+  // Depth of the front of the glass at (x, y).
+  float glassZ(float x, float y) const;
   const std::vector<CrtButton>& buttons() const { return buttons_; }
 
   // How the video sits on the glass: it covers the glass's whole UV extent (overscan), with the
@@ -67,4 +71,9 @@ class TvModel {
   ScreenMask mask_;
   Vec3 boundsMin_, boundsMax_;
   float screenHalfW_ = 0, screenHalfH_ = 0;
+  Vec3 pictureCentre_;  // the picture covers the whole glass here
+  // Glass depth sampled on a grid across its bounds, for glassZ().
+  static constexpr int kGlassGridW = 48, kGlassGridH = 36;
+  float glassHalfW_ = 0, glassHalfH_ = 0;
+  std::vector<float> glassDepth_;
 };

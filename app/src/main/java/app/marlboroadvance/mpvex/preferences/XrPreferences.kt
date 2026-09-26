@@ -2,7 +2,7 @@ package app.marlboroadvance.mpvex.preferences
 
 import app.marlboroadvance.mpvex.preferences.preference.PreferenceStore
 
-/** Settings for the immersive Quest CRT player. Read when the XR player starts. */
+/** Settings for the immersive Quest CRT player, also changed from its in-headset panel. */
 class XrPreferences(
   preferenceStore: PreferenceStore,
 ) {
@@ -16,6 +16,8 @@ class XrPreferences(
   val scanlinesFadeWithDistance = preferenceStore.getBoolean("xr_scanlines_fade", true)
   val glassReflections = preferenceStore.getInt("xr_glass_reflections_percent", 100)
 
+  // 0 passthrough, 1 a dark room with passthrough off.
+  val surroundings = preferenceStore.getInt("xr_surroundings", 0)
   val roomDimming = preferenceStore.getInt("xr_room_dimming_percent", 0)
   val roomSaturation = preferenceStore.getInt("xr_room_saturation_percent", 100)
 

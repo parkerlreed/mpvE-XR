@@ -158,6 +158,29 @@ object VrPreferencesScreen : Screen {
           item { PreferenceSectionHeader(title = stringResource(R.string.pref_vr_section_room)) }
           item {
             PreferenceCard {
+              val surroundings by preferences.surroundings.collectAsState()
+              val surroundingNames = listOf(
+                stringResource(R.string.pref_vr_surroundings_passthrough),
+                stringResource(R.string.pref_vr_surroundings_dark_room),
+              )
+              ListPreference(
+                value = surroundings,
+                onValueChange = preferences.surroundings::set,
+                values = surroundingNames.indices.toList(),
+                valueToText = { AnnotatedString(surroundingNames[it]) },
+                title = { Text(stringResource(R.string.pref_vr_surroundings)) },
+                summary = {
+                  Summary(
+                    stringResource(
+                      R.string.pref_vr_surroundings_summary,
+                      surroundingNames.getOrElse(surroundings) { surroundingNames[0] },
+                    ),
+                  )
+                },
+              )
+
+              PreferenceDivider()
+
               PercentSlider(preferences.roomDimming, R.string.pref_vr_room_dimming, 0..95)
 
               PreferenceDivider()

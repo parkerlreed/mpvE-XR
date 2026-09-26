@@ -19,7 +19,11 @@ constexpr Vec3 kPlastic{0.045f, 0.044f, 0.048f};
 constexpr Vec3 kTrim{0.018f, 0.018f, 0.020f};
 constexpr Vec3 kLedOn{0.05f, 0.9f, 0.12f};
 constexpr Vec3 kLedIdle{0.9f, 0.25f, 0.02f};
-constexpr Vec3 kController{0.3f, 0.3f, 0.32f};
+constexpr Vec3 kRemote{0.022f, 0.022f, 0.025f};
+constexpr Vec3 kRemoteKey{0.30f, 0.30f, 0.32f};
+constexpr Vec3 kRemotePower{0.55f, 0.03f, 0.02f};
+constexpr Vec3 kIrIdle{0.10f, 0.01f, 0.01f};
+constexpr Vec3 kIrLit{1.0f, 0.12f, 0.05f};
 constexpr Vec3 kRay{0.55f, 0.75f, 1.0f};
 constexpr Vec3 kRayHit{1.0f, 0.85f, 0.35f};
 constexpr Vec3 kSlotInterior{0.003f, 0.003f, 0.0035f};
@@ -113,6 +117,7 @@ uniform float uLines;
 uniform float uScanlineStrength;
 uniform float uScanlineFade;
 uniform float uReflections;
+uniform float uRoomLight;
 // Glass extent in its UVs (min.xy, max.xy); the video covers all of it.
 uniform vec4 uVideoRect;
 uniform vec2 uVideoFlip;
@@ -123,6 +128,13 @@ uniform sampler2D uOcclusion;
 uniform float uOcclusionStrength;
 uniform float uVignette;
 out vec4 fragColor;
+
+// The same room the cabinet's material reflects.
+vec3 environment(vec3 dir) {
+  vec3 c = mix(vec3(0.22, 0.21, 0.20), vec3(0.55, 0.56, 0.58), smoothstep(-0.05, 0.35, dir.y));
+  return mix(vec3(0.06, 0.055, 0.05), c, smoothstep(-0.75, -0.05, dir.y));
+}
+
 void main() {
   vec3 n = normalize(vNrm);
   if (!gl_FrontFacing) n = -n;
@@ -148,11 +160,13 @@ void main() {
   float ao = mix(1.0, texture(uOcclusion, vUv).r, uOcclusionStrength);
   video *= ao;
 
-  // Dark glass with a soft fresnel sheen and a broad overhead highlight.
+  // Glass reflects the room, a few percent face on and more at an angle, plus a lamp above and
+  // behind the viewer that the tube's bulge catches near its top.
   vec3 glass = vec3(0.0015, 0.0018, 0.0016);
-  float fresnel = pow(1.0 - max(dot(n, v), 0.0), 4.0);
-  vec3 l = normalize(vec3(0.3, 1.0, 0.5));
-  float highlight = pow(max(dot(reflect(-l, n), v), 0.0), 60.0);
+  vec3 r = reflect(-v, n);
+  float fresnel = 0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+  float lamp = pow(max(dot(r, normalize(v + vec3(0.0, 0.9, 0.0))), 0.0), 24.0);
+  vec3 reflection = (environment(r) * fresnel + vec3(0.35) * lamp) * uRoomLight;
   // Keep the model's painted mask (with its rounded corners) over the edges of the picture.
   float inside = 1.0;
   vec3 maskColor = vec3(0.0);
@@ -160,8 +174,7 @@ void main() {
     maskColor = texture(uMask, vUv).rgb * ao;
     inside = smoothstep(uMaskThreshold * 0.7, uMaskThreshold * 1.3, dot(maskColor, vec3(1.0 / 3.0)));
   }
-  vec3 c = mix(maskColor, glass + video, inside) +
-           (vec3(0.02) * fresnel + vec3(0.05) * highlight) * uReflections;
+  vec3 c = mix(maskColor, glass + video, inside) + reflection * uReflections;
   fragColor = vec4(c, 1.0);
 }
 )";
@@ -279,8 +292,10 @@ const char* kOccluderVs = R"(#version 300 es
 layout(location = 0) in vec3 aPos;
 uniform mat4 uViewProj;
 uniform vec4 uSpheres[128];
+out vec3 vNrm;
 void main() {
   vec4 s = uSpheres[gl_InstanceID];
+  vNrm = aPos;
   gl_Position = uViewProj * vec4(s.xyz + aPos * s.w, 1.0);
 }
 )";
@@ -293,12 +308,14 @@ layout(location = 3) in vec4 aWeights;
 uniform mat4 uViewProj;
 uniform mat4 uSkin[26];
 uniform float uInflate;
+out vec3 vNrm;
 void main() {
   ivec4 j = clamp(ivec4(aJoints), 0, 25);
   mat4 m = uSkin[j.x] * aWeights.x + uSkin[j.y] * aWeights.y + uSkin[j.z] * aWeights.z +
            uSkin[j.w] * aWeights.w;
   vec3 p = (m * vec4(aPos, 1.0)).xyz;
   vec3 n = normalize(mat3(m) * aNrm);
+  vNrm = n;
   // Grow the hand a little so small tracking errors don't show slivers of the set over it.
   gl_Position = uViewProj * vec4(p + n * uInflate, 1.0);
 }
@@ -309,6 +326,66 @@ const char* kOccluderFs = R"(#version 300 es
 precision mediump float;
 out vec4 fragColor;
 void main() { fragColor = vec4(0.0); }
+)";
+
+// Plain grey hands, for when passthrough can't show the real ones.
+const char* kSolidHandFs = R"(#version 300 es
+precision mediump float;
+in vec3 vNrm;
+out vec4 fragColor;
+void main() {
+  float light = 0.35 + 0.65 * max(dot(normalize(vNrm), normalize(vec3(0.3, 1.0, 0.5))), 0.0);
+  fragColor = vec4(vec3(0.20, 0.21, 0.24) * light, 1.0);
+}
+)";
+
+const char* kRoomVs = R"(#version 300 es
+layout(location = 0) in vec3 aPos;
+uniform mat4 uModel;
+uniform mat4 uViewProj;
+out vec3 vWorld;
+void main() {
+  vec4 w = uModel * vec4(aPos, 1.0);
+  vWorld = w.xyz;
+  gl_Position = uViewProj * w;
+}
+)";
+
+// Near-black sky, and a floor with a faint one-metre grid that fades into the distance.
+const char* kRoomFs = R"(#version 300 es
+precision highp float;
+in vec3 vWorld;
+uniform vec3 uEye;
+uniform float uFloor;
+out vec4 fragColor;
+void main() {
+  vec3 c;
+  if (uFloor > 0.5) {
+    vec2 g = abs(fract(vWorld.xz - 0.5) - 0.5) / fwidth(vWorld.xz);
+    float line = 1.0 - min(min(g.x, g.y), 1.0);
+    float fade = exp(-length(vWorld.xz - uEye.xz) * 0.12);
+    c = vec3(0.010, 0.011, 0.014) + vec3(0.05, 0.06, 0.08) * line * fade;
+  } else {
+    float up = clamp(normalize(vWorld - uEye).y, 0.0, 1.0);
+    c = mix(vec3(0.018, 0.020, 0.026), vec3(0.003, 0.003, 0.005), up);
+  }
+  fragColor = vec4(c, 1.0);
+}
+)";
+
+const char* kPanelFs = R"(#version 300 es
+precision mediump float;
+in vec3 vWorld;
+in vec3 vNrm;
+in vec2 vUv;
+uniform sampler2D uTex;
+out vec4 fragColor;
+void main() {
+  vec4 c = texture(uTex, vUv);
+  if (c.a < 0.5) discard;
+  // The bitmap is sRGB; the swapchain encodes on write.
+  fragColor = vec4(pow(c.rgb / c.a, vec3(2.2)), 1.0);
+}
 )";
 
 GLuint compile(GLenum type, const char* src) {
@@ -572,6 +649,68 @@ Mesh buildUnitSphere() {
   return b.upload();
 }
 
+// TV remote in the controller's aim space: -Z points at the TV, +Y is the top face.
+constexpr float kRemoteTop = 0.007f;
+
+Mesh buildRemoteBody() {
+  MeshBuilder b;
+  b.box({-0.021f, -0.011f, 0.0f}, {0.021f, kRemoteTop, 0.13f});
+  return b.upload();
+}
+
+Mesh buildRemoteKeys() {
+  MeshBuilder b;
+  // Number pad.
+  for (int row = 0; row < 4; ++row) {
+    for (int col = -1; col <= 1; ++col) {
+      float x = col * 0.011f, z = 0.058f + row * 0.011f;
+      b.box({x - 0.0035f, kRemoteTop, z - 0.003f}, {x + 0.0035f, kRemoteTop + 0.0025f, z + 0.003f});
+    }
+  }
+  // Channel / volume rockers either side of the pad.
+  for (float x : {-0.013f, 0.013f}) {
+    b.box({x - 0.003f, kRemoteTop, 0.022f}, {x + 0.003f, kRemoteTop + 0.003f, 0.042f});
+  }
+  return b.upload();
+}
+
+Mesh buildRemotePad() {
+  MeshBuilder b;
+  b.box({-0.007f, kRemoteTop, 0.029f}, {0.007f, kRemoteTop + 0.003f, 0.035f});
+  b.box({-0.003f, kRemoteTop, 0.025f}, {0.003f, kRemoteTop + 0.003f, 0.039f});
+  return b.upload();
+}
+
+Mesh buildRemotePower() {
+  MeshBuilder b;
+  b.box({-0.015f, kRemoteTop, 0.007f}, {-0.007f, kRemoteTop + 0.003f, 0.013f});
+  return b.upload();
+}
+
+// IR window on the front end, where the ray comes out.
+Mesh buildRemoteIr() {
+  MeshBuilder b;
+  b.box({-0.012f, -0.006f, -0.002f}, {0.012f, 0.003f, 0.0f});
+  return b.upload();
+}
+
+Mesh buildFloor() {
+  MeshBuilder b;
+  b.quad({-30, 0, 30}, {30, 0, 30}, {30, 0, -30}, {-30, 0, -30});
+  return b.upload();
+}
+
+// -1..1 square facing +Z, with the texture's first row at the top.
+Mesh buildPanelQuad() {
+  MeshBuilder b;
+  b.vertex({-1, -1, 0}, {0, 0, 1}, 0, 1);
+  b.vertex({1, -1, 0}, {0, 0, 1}, 1, 1);
+  b.vertex({1, 1, 0}, {0, 0, 1}, 1, 0);
+  b.vertex({-1, 1, 0}, {0, 0, 1}, 0, 0);
+  b.indices = {0, 1, 2, 0, 2, 3};
+  return b.upload();
+}
+
 Mesh buildUnitBox() {
   MeshBuilder b;
   b.box({-0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, 0.5f});
@@ -590,6 +729,23 @@ Mat4 scaled(const Mat4& base, Vec3 s, Vec3 offset) {
   return base * local;
 }
 
+// The unit box stretched from a to b, `thickness` across.
+Mat4 segment(Vec3 a, Vec3 b, float thickness) {
+  Vec3 z = b - a;
+  Vec3 up = std::fabs(z.y) > 0.9f * length(z) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+  Vec3 x = normalize(cross(up, z)) * thickness;
+  Vec3 y = normalize(cross(z, x)) * thickness;
+  Vec3 c = (a + b) * 0.5f;
+  Mat4 m = Mat4::identity();
+  const Vec3 cols[4] = {x, y, z, c};
+  for (int i = 0; i < 4; ++i) {
+    m.m[i * 4] = cols[i].x;
+    m.m[i * 4 + 1] = cols[i].y;
+    m.m[i * 4 + 2] = cols[i].z;
+  }
+  return m;
+}
+
 }  // namespace
 
 bool CrtScene::init(const char* modelPath) {
@@ -598,11 +754,23 @@ bool CrtScene::init(const char* modelPath) {
   pbrProgram_ = link(kPbrVs, kPbrFs);
   occluderProgram_ = link(kOccluderVs, kOccluderFs);
   handProgram_ = link(kHandVs, kOccluderFs);
-  if (!litProgram_ || !screenProgram_ || !pbrProgram_ || !occluderProgram_ || !handProgram_) {
+  solidHandProgram_ = link(kHandVs, kSolidHandFs);
+  solidOccluderProgram_ = link(kOccluderVs, kSolidHandFs);
+  roomProgram_ = link(kRoomVs, kRoomFs);
+  panelProgram_ = link(kLitVs, kPanelFs);
+  if (!litProgram_ || !screenProgram_ || !pbrProgram_ || !occluderProgram_ || !handProgram_ ||
+      !solidHandProgram_ || !solidOccluderProgram_ || !roomProgram_ || !panelProgram_) {
     return false;
   }
+  floor_ = buildFloor();
+  panelQuad_ = buildPanelQuad();
   box_ = buildUnitBox();
   sphere_ = buildUnitSphere();
+  remoteBody_ = buildRemoteBody();
+  remoteKeys_ = buildRemoteKeys();
+  remotePad_ = buildRemotePad();
+  remotePower_ = buildRemotePower();
+  remoteIr_ = buildRemoteIr();
 
   if (modelPath && *modelPath) {
     model_ = new TvModel();
@@ -611,6 +779,7 @@ bool CrtScene::init(const char* modelPath) {
       boundsMax_ = model_->boundsMax();
       screenHalfW_ = model_->screenHalfW();
       screenHalfH_ = model_->screenHalfH();
+      pictureCentre_ = model_->pictureCentre();
       buttons_ = model_->buttons();
       return true;
     }
@@ -639,7 +808,8 @@ float CrtScene::screenDiagonalInches() const {
 
 void CrtScene::destroy() {
   for (Mesh* m : {&body_, &trim_, &slot_, &accent_, &led_, &screen_, &box_, &sphere_,
-                  &handMeshes_[0], &handMeshes_[1]}) {
+                  &handMeshes_[0], &handMeshes_[1], &remoteBody_, &remoteKeys_, &remotePad_,
+                  &remotePower_, &remoteIr_, &floor_, &panelQuad_}) {
     freeMesh(*m);
   }
   for (int i = 0; i < kMaxButtons; ++i) {
@@ -655,8 +825,11 @@ void CrtScene::destroy() {
   if (screenProgram_) glDeleteProgram(screenProgram_);
   if (pbrProgram_) glDeleteProgram(pbrProgram_);
   if (occluderProgram_) glDeleteProgram(occluderProgram_);
-  if (handProgram_) glDeleteProgram(handProgram_);
-  litProgram_ = screenProgram_ = pbrProgram_ = occluderProgram_ = handProgram_ = 0;
+  for (GLuint* p : {&litProgram_, &screenProgram_, &pbrProgram_, &occluderProgram_, &handProgram_,
+                    &solidHandProgram_, &solidOccluderProgram_, &roomProgram_, &panelProgram_}) {
+    if (*p) glDeleteProgram(*p);
+    *p = 0;
+  }
 }
 
 void CrtScene::setVideo(GLuint externalTexture, const float* texMatrix, bool hasFrame) {
@@ -694,14 +867,41 @@ void CrtScene::draw(const Mat4& viewProj, Vec3 eye, const Pose& crtPose, float c
   for (int i = 0; i < controllerCount; ++i) {
     const ControllerVisual& c = controllers[i];
     if (!c.active) continue;
+    if (c.tipDot) {
+      float r = c.tipDotSize;
+      drawLit(sphere_, scaled(Mat4::fromPose({{}, c.tipDotAt}), {r, r, r}, {}), viewProj, eye,
+              c.tipTouching ? kRayHit : kRay, 1.0f, 0.0f);
+    }
+    if (c.grabbing) {
+      if (!c.directGrab) {
+        drawLit(box_, segment(c.aim.p, c.anchor, 0.004f), viewProj, eye, kRayHit, 1.0f, 0.0f);
+      }
+      drawLit(sphere_, scaled(Mat4::fromPose({{}, c.anchor}), {0.008f, 0.008f, 0.008f}, {}), viewProj,
+              eye, kRayHit, 1.0f, 0.0f);
+      continue;
+    }
+    if (c.inReach) {
+      drawLit(sphere_, scaled(Mat4::fromPose({{}, c.aim.p}), {0.008f, 0.008f, 0.008f}, {}), viewProj,
+              eye, kRay, 1.0f, 0.0f);
+      continue;
+    }
     Mat4 aim = Mat4::fromPose(c.aim);
     if (c.drawController) {
-      drawLit(box_, scaled(aim, {0.025f, 0.025f, 0.08f}, {0, 0, 0.03f}), viewProj, eye,
-              kController, 0.0f, 0.3f);
+      drawLit(remoteBody_, aim, viewProj, eye, kRemote, 0.0f, 0.35f);
+      drawLit(remoteKeys_, aim, viewProj, eye, kRemoteKey, 0.0f, 0.2f);
+      drawLit(remotePad_, aim, viewProj, eye, kAccent, 0.0f, 0.6f);
+      drawLit(remotePower_, aim, viewProj, eye, kRemotePower, 0.1f, 0.2f);
+      drawLit(remoteIr_, aim, viewProj, eye, c.highlighted ? kIrLit : kIrIdle,
+              c.highlighted ? 1.0f : 0.0f, 0.8f);
     }
     if (c.rayLength > 0) {
       drawLit(box_, scaled(aim, {0.002f, 0.002f, c.rayLength}, {0, 0, -c.rayLength * 0.5f}),
               viewProj, eye, c.highlighted ? kRayHit : kRay, 1.0f, 0.0f);
+    }
+    if (c.rayDot) {
+      Vec3 end = transformPoint(c.aim, {0, 0, -c.rayLength});
+      drawLit(sphere_, scaled(Mat4::fromPose({{}, end}), {0.004f, 0.004f, 0.004f}, {}), viewProj,
+              eye, kRayHit, 1.0f, 0.0f);
     }
   }
 
@@ -716,6 +916,7 @@ void CrtScene::draw(const Mat4& viewProj, Vec3 eye, const Pose& crtPose, float c
   glUniform1f(glGetUniformLocation(screenProgram_, "uScanlineStrength"), scanlines_);
   glUniform1f(glGetUniformLocation(screenProgram_, "uScanlineFade"), scanlineFade_ ? 1.0f : 0.0f);
   glUniform1f(glGetUniformLocation(screenProgram_, "uReflections"), reflections_);
+  glUniform1f(glGetUniformLocation(screenProgram_, "uRoomLight"), darkRoom_ ? 0.1f : 1.0f);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
   glUniform1i(glGetUniformLocation(screenProgram_, "uTex"), 0);
@@ -841,6 +1042,46 @@ int CrtScene::buttonUnderPoint(const Pose& crtPose, float crtScale, Vec3 point, 
   return best;
 }
 
+bool CrtScene::pictureAt(const Pose& crtPose, float crtScale, Vec3 origin, Vec3 dir, float* u,
+                         float* v, float* t) const {
+  Vec3 o, d;
+  toModel(crtPose, crtScale, origin, dir, &o, &d);
+  // Only rays coming at the front. Start on the plane through the middle of the glass and settle
+  // onto its curve; the bulge is shallow, so a few steps do.
+  if (d.z >= -1e-6f) return false;
+  float z = glassZ(0, 0);
+  for (int i = 0; i < 4; ++i) {
+    Vec3 p = o + d * ((z - o.z) / d.z);
+    z = glassZ(p.x, p.y);
+  }
+  *t = (z - o.z) / d.z;
+  if (*t < 0) return false;
+  return pictureUnderPoint(crtPose, crtScale, origin + dir * *t, u, v, nullptr);
+}
+
+bool CrtScene::pictureUnderPoint(const Pose& crtPose, float crtScale, Vec3 point, float* u,
+                                 float* v, float* depth) const {
+  Vec3 p = transformPoint(inverse(crtPose), point) * (1.0f / crtScale);
+  *u = (p.x - pictureCentre_.x) / (2 * screenHalfW_) + 0.5f;
+  *v = 0.5f - (p.y - pictureCentre_.y) / (2 * screenHalfH_);
+  if (depth) *depth = (glassZ(p.x, p.y) - p.z) * crtScale;
+  return *u >= 0 && *u <= 1 && *v >= 0 && *v <= 1;
+}
+
+float CrtScene::glassZ(float x, float y) const {
+  if (model_) return model_->glassZ(x, y);
+  float nx = std::clamp(x / kScreenHalfW, -1.0f, 1.0f), ny = std::clamp(y / kScreenHalfH, -1.0f, 1.0f);
+  return kScreenEdgeZ + kScreenBulge * (1 - nx * nx) * (1 - ny * ny);
+}
+
+float CrtScene::distanceTo(const Pose& crtPose, float crtScale, Vec3 point) const {
+  Vec3 p = transformPoint(inverse(crtPose), point) * (1.0f / crtScale);
+  Vec3 out{std::max({boundsMin_.x - p.x, 0.0f, p.x - boundsMax_.x}),
+           std::max({boundsMin_.y - p.y, 0.0f, p.y - boundsMax_.y}),
+           std::max({boundsMin_.z - p.z, 0.0f, p.z - boundsMax_.z})};
+  return length(out) * crtScale;
+}
+
 bool CrtScene::nearFront(const Pose& crtPose, float crtScale, Vec3 point, float margin) const {
   Vec3 p = transformPoint(inverse(crtPose), point) * (1.0f / crtScale);
   float m = margin / crtScale;
@@ -848,12 +1089,13 @@ bool CrtScene::nearFront(const Pose& crtPose, float crtScale, Vec3 point, float 
          p.y < boundsMax_.y + m && p.z > boundsMin_.z && p.z < boundsMax_.z + m;
 }
 
-void CrtScene::drawOccluders(const Mat4& viewProj, const float* spheres, int count) {
+void CrtScene::drawOccluders(const Mat4& viewProj, const float* spheres, int count, bool solid) {
   if (count <= 0) return;
   count = std::min(count, kMaxOccluders);
-  glUseProgram(occluderProgram_);
-  glUniformMatrix4fv(glGetUniformLocation(occluderProgram_, "uViewProj"), 1, GL_FALSE, viewProj.m);
-  glUniform4fv(glGetUniformLocation(occluderProgram_, "uSpheres"), count, spheres);
+  GLuint program = solid ? solidOccluderProgram_ : occluderProgram_;
+  glUseProgram(program);
+  glUniformMatrix4fv(glGetUniformLocation(program, "uViewProj"), 1, GL_FALSE, viewProj.m);
+  glUniform4fv(glGetUniformLocation(program, "uSpheres"), count, spheres);
   glBindVertexArray(sphere_.vao);
   glDrawElementsInstanced(GL_TRIANGLES, sphere_.count, GL_UNSIGNED_INT, nullptr, count);
   glBindVertexArray(0);
@@ -902,14 +1144,51 @@ void CrtScene::setHandMesh(int hand, const float* positions, const float* normal
   m.count = static_cast<GLsizei>(tris.size());
 }
 
-void CrtScene::drawHandMesh(int hand, const Mat4& viewProj, const Mat4* skin, float inflate) {
+void CrtScene::drawHandMesh(int hand, const Mat4& viewProj, const Mat4* skin, float inflate,
+                            bool solid) {
   const Mesh& m = handMeshes_[hand];
   if (!m.count) return;
-  glUseProgram(handProgram_);
-  glUniformMatrix4fv(glGetUniformLocation(handProgram_, "uViewProj"), 1, GL_FALSE, viewProj.m);
-  glUniformMatrix4fv(glGetUniformLocation(handProgram_, "uSkin"), kHandJoints, GL_FALSE, skin[0].m);
-  glUniform1f(glGetUniformLocation(handProgram_, "uInflate"), inflate);
+  GLuint program = solid ? solidHandProgram_ : handProgram_;
+  glUseProgram(program);
+  glUniformMatrix4fv(glGetUniformLocation(program, "uViewProj"), 1, GL_FALSE, viewProj.m);
+  glUniformMatrix4fv(glGetUniformLocation(program, "uSkin"), kHandJoints, GL_FALSE, skin[0].m);
+  glUniform1f(glGetUniformLocation(program, "uInflate"), inflate);
   glBindVertexArray(m.vao);
   glDrawElements(GL_TRIANGLES, m.count, GL_UNSIGNED_INT, nullptr);
   glBindVertexArray(0);
+}
+
+void CrtScene::drawRoom(const Mat4& viewProj, Vec3 eye, float floorY) {
+  glUseProgram(roomProgram_);
+  glUniformMatrix4fv(glGetUniformLocation(roomProgram_, "uViewProj"), 1, GL_FALSE, viewProj.m);
+  glUniform3f(glGetUniformLocation(roomProgram_, "uEye"), eye.x, eye.y, eye.z);
+  // The sky sits behind everything else.
+  glDepthMask(GL_FALSE);
+  Mat4 sky = scaled(Mat4::fromPose({{}, eye}), {60, 60, 60}, {});
+  glUniformMatrix4fv(glGetUniformLocation(roomProgram_, "uModel"), 1, GL_FALSE, sky.m);
+  glUniform1f(glGetUniformLocation(roomProgram_, "uFloor"), 0.0f);
+  glBindVertexArray(sphere_.vao);
+  glDrawElements(GL_TRIANGLES, sphere_.count, GL_UNSIGNED_INT, nullptr);
+  glDepthMask(GL_TRUE);
+  Mat4 floor = Mat4::fromPose({{}, {eye.x, floorY, eye.z}});
+  glUniformMatrix4fv(glGetUniformLocation(roomProgram_, "uModel"), 1, GL_FALSE, floor.m);
+  glUniform1f(glGetUniformLocation(roomProgram_, "uFloor"), 1.0f);
+  glBindVertexArray(floor_.vao);
+  glDrawElements(GL_TRIANGLES, floor_.count, GL_UNSIGNED_INT, nullptr);
+  glBindVertexArray(0);
+}
+
+void CrtScene::drawPanel(const Mat4& viewProj, const Pose& pose, float halfW, float halfH,
+                         GLuint texture) {
+  Mat4 model = scaled(Mat4::fromPose(pose), {halfW, halfH, 1}, {});
+  glUseProgram(panelProgram_);
+  glUniformMatrix4fv(glGetUniformLocation(panelProgram_, "uModel"), 1, GL_FALSE, model.m);
+  glUniformMatrix4fv(glGetUniformLocation(panelProgram_, "uViewProj"), 1, GL_FALSE, viewProj.m);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, texture);
+  glUniform1i(glGetUniformLocation(panelProgram_, "uTex"), 0);
+  glBindVertexArray(panelQuad_.vao);
+  glDrawElements(GL_TRIANGLES, panelQuad_.count, GL_UNSIGNED_INT, nullptr);
+  glBindVertexArray(0);
+  glBindTexture(GL_TEXTURE_2D, 0);
 }

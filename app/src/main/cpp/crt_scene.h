@@ -15,10 +15,21 @@ struct Mesh {
 
 struct ControllerVisual {
   bool active = false;
-  bool drawController = true;  // false for tracked hands, which passthrough already shows
+  bool drawController = true;  // the remote; false for tracked hands and the other controller
   Pose aim;
   float rayLength = 0;  // 0 hides the ray
+  bool rayDot = false;  // a cursor at the end of the ray
   bool highlighted = false;
+  // While holding the set the remote is hidden; a ray grab shows a tether to the anchor.
+  bool grabbing = false;
+  bool directGrab = false;
+  Vec3 anchor;  // world space
+  bool inReach = false;  // close enough to grab directly: a marker replaces the remote
+  // Where a fingertip would touch the picture.
+  bool tipDot = false;
+  Vec3 tipDotAt;
+  float tipDotSize = 0;
+  bool tipTouching = false;
 };
 
 // A pressable button on the front panel, in model space.
@@ -56,6 +67,8 @@ class CrtScene {
     scanlineFade_ = scanlineFade;
     reflections_ = reflections;
   }
+  // Dims what the glass reflects, to suit the dark room.
+  void setDarkRoom(bool dark) { darkRoom_ = dark; }
   // Bit i set means button i is hovered / held.
   void setButtonState(uint32_t hovered, uint32_t pressed) {
     hoveredButtons_ = hovered;
@@ -75,11 +88,22 @@ class CrtScene {
   int buttonUnderPoint(const Pose& crtPose, float crtScale, Vec3 point, float* depth) const;
   // True when a point is within `margin` metres in front of, or inside, the set.
   bool nearFront(const Pose& crtPose, float crtScale, Vec3 point, float margin) const;
+  // Where a ray meets the curved glass over the picture, as 0..1 with (0, 0) at its top left. *t is
+  // the distance along the ray. False when it misses the picture.
+  bool pictureAt(const Pose& crtPose, float crtScale, Vec3 origin, Vec3 dir, float* u, float* v,
+                 float* t) const;
+  // The picture position a point is over, and how far (world metres) it is pushed past the
+  // glass: negative while still in front of it.
+  bool pictureUnderPoint(const Pose& crtPose, float crtScale, Vec3 point, float* u, float* v,
+                         float* depth) const;
+  // World distance from a point to the set's bounds, 0 inside.
+  float distanceTo(const Pose& crtPose, float crtScale, Vec3 point) const;
 
   static constexpr int kMaxOccluders = 128;
   // Punches passthrough-coloured holes where tracked hands are in front of the set, so the real
   // hands stay visible. `spheres` holds xyz + radius per sphere, in world space.
-  void drawOccluders(const Mat4& viewProj, const float* spheres, int count);
+  // `solid` draws them as grey hands instead, for when passthrough is off.
+  void drawOccluders(const Mat4& viewProj, const float* spheres, int count, bool solid = false);
 
   // The runtime's skinned hand model, used as a closer-fitting occluder than spheres.
   // `joints4`/`weights4` are four blend joints and weights per vertex.
@@ -88,21 +112,30 @@ class CrtScene {
                    const float* weights4, int vertexCount, const int16_t* indices, int indexCount);
   bool hasHandMesh(int hand) const { return handMeshes_[hand].count > 0; }
   // `skin` holds one matrix per joint: current joint pose * inverse bind pose.
-  void drawHandMesh(int hand, const Mat4& viewProj, const Mat4* skin, float inflate);
+  void drawHandMesh(int hand, const Mat4& viewProj, const Mat4* skin, float inflate,
+                    bool solid = false);
+
+  // Dark surroundings with a floor grid, drawn first in place of passthrough.
+  void drawRoom(const Mat4& viewProj, Vec3 eye, float floorY);
+  // A textured panel facing +Z in `pose`; texels with alpha under half are cut out.
+  void drawPanel(const Mat4& viewProj, const Pose& pose, float halfW, float halfH, GLuint texture);
   // Screen diagonal at scale 1, for the size presets.
   float screenDiagonalInches() const;
   float screenAspect() const { return screenHalfW_ / screenHalfH_; }
 
  private:
   GLuint litProgram_ = 0, screenProgram_ = 0, pbrProgram_ = 0, occluderProgram_ = 0;
-  GLuint handProgram_ = 0;
-  Mesh sphere_;
+  GLuint handProgram_ = 0, solidHandProgram_ = 0, solidOccluderProgram_ = 0;
+  GLuint roomProgram_ = 0, panelProgram_ = 0;
+  Mesh sphere_, floor_, panelQuad_;
   Mesh handMeshes_[2];
   TvModel* model_ = nullptr;
   Vec3 boundsMin_ = kBoundsMin, boundsMax_ = kBoundsMax;
   float screenHalfW_ = kScreenHalfW, screenHalfH_ = kScreenHalfH;
+  Vec3 pictureCentre_;
   std::vector<CrtButton> buttons_;
   Mesh body_, trim_, slot_, accent_, led_, screen_, box_;
+  Mesh remoteBody_, remoteKeys_, remotePad_, remotePower_, remoteIr_;
   Mesh buttonBodies_[kMaxButtons], buttonIcons_[kMaxButtons];
   GLuint videoTexture_ = 0;
   float texMatrix_[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -111,9 +144,12 @@ class CrtScene {
   float scanlines_ = 0.35f;
   bool scanlineFade_ = true;
   float reflections_ = 1.0f;
+  bool darkRoom_ = false;
   uint32_t hoveredButtons_ = 0, pressedButtons_ = 0;
 
   void drawProcedural(const Mat4& model, const Mat4& viewProj, Vec3 eye);
+  // Model-space depth of the front of the glass at (x, y).
+  float glassZ(float x, float y) const;
   void drawLit(const Mesh& mesh, const Mat4& model, const Mat4& viewProj, Vec3 eye, Vec3 color,
                float emissive, float spec);
 };

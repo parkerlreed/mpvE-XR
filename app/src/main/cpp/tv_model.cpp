@@ -299,6 +299,64 @@ bool TvModel::load(const char* path) {
     }
   }
 
+  // 2b. How far the glass bulges across its face: the front-most screen triangle at each grid
+  // point. Gaps take the average of their filled neighbours.
+  glassHalfW_ = screenHalfW_;
+  glassHalfH_ = screenHalfH_;
+  constexpr float kEmpty = -1e9f;
+  glassDepth_.assign(kGlassGridW * kGlassGridH, kEmpty);
+  float cellW = 2 * glassHalfW_ / (kGlassGridW - 1), cellH = 2 * glassHalfH_ / (kGlassGridH - 1);
+  for (const PrimitiveData& p : prims) {
+    if (!p.screen || cellW <= 0 || cellH <= 0) continue;
+    for (size_t i = 0; i + 2 < p.indices.size(); i += 3) {
+      const float* a = &p.verts[p.indices[i] * kFloatsPerVertex];
+      const float* b = &p.verts[p.indices[i + 1] * kFloatsPerVertex];
+      const float* c = &p.verts[p.indices[i + 2] * kFloatsPerVertex];
+      float area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+      if (std::fabs(area) < 1e-12f) continue;
+      int gx0 = std::max(0, static_cast<int>(std::floor((std::min({a[0], b[0], c[0]}) + glassHalfW_) / cellW)));
+      int gx1 = std::min(kGlassGridW - 1, static_cast<int>(std::ceil((std::max({a[0], b[0], c[0]}) + glassHalfW_) / cellW)));
+      int gy0 = std::max(0, static_cast<int>(std::floor((std::min({a[1], b[1], c[1]}) + glassHalfH_) / cellH)));
+      int gy1 = std::min(kGlassGridH - 1, static_cast<int>(std::ceil((std::max({a[1], b[1], c[1]}) + glassHalfH_) / cellH)));
+      for (int gy = gy0; gy <= gy1; ++gy) {
+        for (int gx = gx0; gx <= gx1; ++gx) {
+          float x = -glassHalfW_ + gx * cellW, y = -glassHalfH_ + gy * cellH;
+          float wb = ((x - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (y - a[1])) / area;
+          float wc = ((b[0] - a[0]) * (y - a[1]) - (x - a[0]) * (b[1] - a[1])) / area;
+          float wa = 1 - wb - wc;
+          if (wa < -0.01f || wb < -0.01f || wc < -0.01f) continue;
+          float& d = glassDepth_[gy * kGlassGridW + gx];
+          d = std::max(d, wa * a[2] + wb * b[2] + wc * c[2]);
+        }
+      }
+    }
+  }
+  for (int pass = 0; pass < 4; ++pass) {
+    std::vector<float> next = glassDepth_;
+    for (int gy = 0; gy < kGlassGridH; ++gy) {
+      for (int gx = 0; gx < kGlassGridW; ++gx) {
+        if (glassDepth_[gy * kGlassGridW + gx] != kEmpty) continue;
+        float sum = 0;
+        int count = 0;
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            int x = gx + dx, y = gy + dy;
+            if (x < 0 || y < 0 || x >= kGlassGridW || y >= kGlassGridH) continue;
+            float d = glassDepth_[y * kGlassGridW + x];
+            if (d == kEmpty) continue;
+            sum += d;
+            ++count;
+          }
+        }
+        if (count) next[gy * kGlassGridW + gx] = sum / count;
+      }
+    }
+    glassDepth_.swap(next);
+  }
+  for (float& d : glassDepth_) {
+    if (d == kEmpty) d = 0;
+  }
+
   // 3. Textures and materials.
   float anisotropy = 1.0f;
   const char* ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
@@ -591,4 +649,16 @@ void TvModel::drawScreen() const {
                    reinterpret_cast<const void*>(d.firstIndex * sizeof(GLuint)));
   }
   glBindVertexArray(0);
+}
+
+float TvModel::glassZ(float x, float y) const {
+  if (glassDepth_.empty() || glassHalfW_ <= 0 || glassHalfH_ <= 0) return 0;
+  float fx = std::clamp((x + glassHalfW_) / (2 * glassHalfW_), 0.0f, 1.0f) * (kGlassGridW - 1);
+  float fy = std::clamp((y + glassHalfH_) / (2 * glassHalfH_), 0.0f, 1.0f) * (kGlassGridH - 1);
+  int x0 = std::min(static_cast<int>(fx), kGlassGridW - 2), y0 = std::min(static_cast<int>(fy), kGlassGridH - 2);
+  float tx = fx - x0, ty = fy - y0;
+  auto at = [&](int gx, int gy) { return glassDepth_[gy * kGlassGridW + gx]; };
+  float top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+  float bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+  return top + (bottom - top) * ty;
 }

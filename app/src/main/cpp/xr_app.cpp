@@ -17,6 +17,8 @@
 #include <atomic>
 #include <cstring>
 #include <ctime>
+#include <iterator>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -41,9 +43,24 @@ namespace {
 
 std::atomic<bool> gExitRequested{false};
 
+// Changes from the app while the session runs, applied at the start of the next frame.
+std::mutex gPendingMutex;
+std::vector<float> gPendingSettings;
+bool gSettingsPending = false;
+std::string gPendingModel;
+bool gModelPending = false;
+
 constexpr float kSizePresetsInches[] = {14, 20, 27, 32, 40};
 
 constexpr int kLeft = 0, kRight = 1;
+
+// How close (metres) a controller or pinch must be to the set to grab it directly.
+constexpr float kGrabReach = 0.06f;
+
+// Settings panel size; the app draws it at this aspect.
+constexpr float kPanelHalfW = 0.18f, kPanelHalfH = 0.24f;
+
+enum TouchTarget { kTargetPicture, kTargetPanel, kTargetCount };
 
 // VR preferences from Kotlin, in XrPlayerActivity.nativeSettings() order.
 struct XrSettings {
@@ -53,13 +70,18 @@ struct XrSettings {
   float scanlines = 0.35f;
   bool scanlineFade = true;
   float reflections = 1.0f;
-  float reachDistance = 0.6f;        // where the menu gesture puts the set
+  float reachDistance = 0.6f;        // where recentering with hands puts the set
+  bool solidRoom = false;            // a dark room instead of passthrough
 
   void read(JNIEnv* env, jfloatArray array) {
     if (!array) return;
-    float v[7];
-    jsize n = std::min<jsize>(env->GetArrayLength(array), 7);
+    float v[8];
+    jsize n = std::min<jsize>(env->GetArrayLength(array), 8);
     env->GetFloatArrayRegion(array, 0, n, v);
+    set(v, n);
+  }
+
+  void set(const float* v, int n) {
     if (n > 0) handPadding = std::clamp(v[0], 0.0f, 0.03f);
     if (n > 1) passthroughOpacity = std::clamp(v[1], 0.0f, 1.0f);
     if (n > 2) passthroughSaturation = std::clamp(v[2], 0.0f, 1.0f);
@@ -67,6 +89,7 @@ struct XrSettings {
     if (n > 4) scanlineFade = v[4] > 0.5f;
     if (n > 5) reflections = std::clamp(v[5], 0.0f, 1.0f);
     if (n > 6) reachDistance = std::clamp(v[6], 0.3f, 1.5f);
+    if (n > 7) solidRoom = v[7] > 0.5f;
   }
 };
 
@@ -79,6 +102,11 @@ struct Bridge {
   jmethodID onAction = nullptr;
   jmethodID onCrtPoseChanged = nullptr;
   jmethodID onSessionEnded = nullptr;
+  // Optional, so an app can leave them out.
+  jmethodID onTouch = nullptr;
+  jmethodID updatePanel = nullptr;
+  jmethodID onPanelTouch = nullptr;
+  jmethodID onScreenAspect = nullptr;
   jfloatArray matrix = nullptr;
 
   bool init(JNIEnv* e, jobject bridge) {
@@ -91,6 +119,16 @@ struct Bridge {
     onAction = env->GetMethodID(cls, "onAction", "(I)V");
     onCrtPoseChanged = env->GetMethodID(cls, "onCrtPoseChanged", "([F)V");
     onSessionEnded = env->GetMethodID(cls, "onSessionEnded", "()V");
+    auto optional = [&](const char* name, const char* sig) -> jmethodID {
+      if (env->ExceptionCheck()) return nullptr;
+      jmethodID m = env->GetMethodID(cls, name, sig);
+      if (!m) env->ExceptionClear();
+      return m;
+    };
+    onTouch = optional("onTouch", "(FFZ)V");
+    updatePanel = optional("updatePanel", "(I)Z");
+    onPanelTouch = optional("onPanelTouch", "(FFZ)I");
+    onScreenAspect = optional("onScreenAspect", "(F)V");
     env->DeleteLocalRef(cls);
     if (env->ExceptionCheck()) {
       env->ExceptionDescribe();
@@ -145,6 +183,37 @@ struct Bridge {
     check();
   }
 
+  bool canTouch() const { return onTouch != nullptr; }
+
+  // Position across the picture, 0..1 from the top left.
+  void touch(float u, float v, bool down) {
+    env->CallVoidMethod(obj, onTouch, static_cast<jfloat>(u), static_cast<jfloat>(v),
+                        static_cast<jboolean>(down));
+    check();
+  }
+
+  bool hasPanel() const { return updatePanel && onPanelTouch; }
+
+  // Redraws the panel into `texture` if it changed.
+  void drawPanel(GLuint texture) {
+    env->CallBooleanMethod(obj, updatePanel, static_cast<jint>(texture));
+    check();
+  }
+
+  // Returns a PanelCommand.
+  int panelTouch(float u, float v, bool down) {
+    jint command = env->CallIntMethod(obj, onPanelTouch, static_cast<jfloat>(u),
+                                      static_cast<jfloat>(v), static_cast<jboolean>(down));
+    check();
+    return command;
+  }
+
+  void screenAspect(float aspect) {
+    if (!onScreenAspect) return;
+    env->CallVoidMethod(obj, onScreenAspect, static_cast<jfloat>(aspect));
+    check();
+  }
+
   void sessionEnded() {
     env->CallVoidMethod(obj, onSessionEnded);
     check();
@@ -170,9 +239,22 @@ struct Hand {
        menuPressed = false;
 
   // Interaction state.
+  bool squeezeDown = false;
   bool grabbing = false;
+  bool directGrab = false;  // held in the hand rather than along the ray
+  Pose hold;                // pose the set follows while grabbed
   Pose grabOffset;
   float grabYaw = 0;
+  Vec3 anchor;              // grab point in the set's model space
+  bool holdingPanel = false;  // the settings panel, moved like the set but on its own
+  bool directPanelGrab = false;
+  Pose panelOffset;
+  Vec3 panelAnchor;         // grab point in panel space
+  bool touching = false;    // pressing on the picture or panel, at touchU/V
+  int touchTarget = kTargetPicture;
+  bool pokeTouch = false;   // by fingertip rather than laser
+  int armedTarget = -1;     // fingertip was in front of this target, so pushing in counts
+  float touchU = 0, touchV = 0;
   bool triggerDown = false;
   int hoverButton = -1;
   int pressedButton = -1;
@@ -192,7 +274,9 @@ struct Hand {
   bool pinchOnSet = false;     // pinch began on the set body: a tap or the start of a grab
   float pinchHeld = 0;
   Vec3 pinchStart;
+  Pose pinchPose;              // between thumb and index tips, oriented like the palm
   bool nearSet = false;        // fingertip close enough to the set to poke instead of point
+  bool nearPanel = false;      // likewise for the settings panel
   int pokeButton = -1;
   bool pokeArmed = false;      // tip was in front of a button face, so pushing in counts
   std::vector<Pose> bindPoses;  // hand mesh bind pose per joint, when the runtime provides one
@@ -202,6 +286,19 @@ struct Hand {
   float untracked = 0;
   bool loggedActive = false, loggedTracked = false;
 };
+
+// Keeps a laser touch following the ray while it stays on its target.
+void updateLaserTouch(Hand& hand, bool onPicture, float u, float v, bool onPanel, float pu,
+                      float pv) {
+  if (!hand.touching || hand.pokeTouch) return;
+  if (hand.touchTarget == kTargetPicture && onPicture) {
+    hand.touchU = u;
+    hand.touchV = v;
+  } else if (hand.touchTarget == kTargetPanel && onPanel) {
+    hand.touchU = pu;
+    hand.touchV = pv;
+  }
+}
 
 class XrApp {
  public:
@@ -241,6 +338,21 @@ class XrApp {
            secondaryAction_ = XR_NULL_HANDLE, menuAction_ = XR_NULL_HANDLE,
            hapticAction_ = XR_NULL_HANDLE;
   Hand hands_[2];
+  // Per target, the one hand whose touch is passed on.
+  struct TouchState {
+    int hand = -1;
+    float u = 0, v = 0;
+  };
+  TouchState touches_[kTargetCount];
+  bool panelOpen_ = false;
+  Pose panelPose_;  // faces +Z, towards the viewer
+  GLuint panelTexture_ = 0;
+  float floorY_ = 0;
+  int remoteHand_ = kRight;  // controller last used, which is drawn as the remote
+  // Both hands holding the set: their spacing scales it.
+  bool resizing_ = false;
+  float resizeDist0_ = 0, resizeScale0_ = 1, resizeYaw_ = 0;
+  Pose resizeOffset_;
 
   bool passthroughSupported_ = false;
   XrPassthroughFB passthrough_ = XR_NULL_HANDLE;
@@ -250,6 +362,9 @@ class XrApp {
   PFN_xrCreatePassthroughLayerFB xrCreatePassthroughLayerFB_ = nullptr;
   PFN_xrDestroyPassthroughLayerFB xrDestroyPassthroughLayerFB_ = nullptr;
   PFN_xrPassthroughLayerSetStyleFB xrPassthroughLayerSetStyleFB_ = nullptr;
+  PFN_xrPassthroughStartFB xrPassthroughStartFB_ = nullptr;
+  PFN_xrPassthroughPauseFB xrPassthroughPauseFB_ = nullptr;
+  bool passthroughPaused_ = false;
 
   bool handTrackingSupported_ = false;
   bool handAimSupported_ = false;
@@ -285,8 +400,24 @@ class XrApp {
   void updateHand(int h, float dt);
   void updateTrackedHand(int h, float dt);
   void locateHand(int h, XrTime time);
-  void startGrab(int h);
+  void startGrab(int h, bool direct, Vec3 at);
   void endGrab(int h);
+  Pose resizeFrame();
+  void applyGrab();
+  void syncTouch(int target);
+  void pokeTouch(Hand& hand, int target, bool over, float u, float v, float into);
+  void togglePanel();
+  void closePanel();
+  void panelCommand(int command);
+  // The panel's position under a ray or point, 0..1 from its top left, like the picture's.
+  bool panelAt(Vec3 origin, Vec3 dir, float* u, float* v, float* t) const;
+  bool panelUnderPoint(Vec3 point, float* u, float* v, float* into) const;
+  float panelDistance(Vec3 point) const;
+  bool startPanelGrab(int h, bool direct, Vec3 at);
+  void endPanelGrab(int h);
+  void applyPending();
+  void applyPassthrough();
+  bool showPassthrough() const { return passthroughLayer_ && !settings_.solidRoom; }
   void pressButton(int h, int button);
   void repeatHeldButton(int h, float dt);
   int collectOccluders(int h, float* spheres, int max) const;
@@ -410,6 +541,8 @@ bool XrApp::initInstance(JNIEnv* env, jobject activity) {
     load("xrCreatePassthroughLayerFB", xrCreatePassthroughLayerFB_);
     load("xrDestroyPassthroughLayerFB", xrDestroyPassthroughLayerFB_);
     load("xrPassthroughLayerSetStyleFB", xrPassthroughLayerSetStyleFB_);
+    load("xrPassthroughStartFB", xrPassthroughStartFB_);
+    load("xrPassthroughPauseFB", xrPassthroughPauseFB_);
     passthroughSupported_ = xrCreatePassthroughFB_ && xrDestroyPassthroughFB_ &&
                             xrCreatePassthroughLayerFB_ && xrDestroyPassthroughLayerFB_;
   }
@@ -614,10 +747,20 @@ void XrApp::initPassthrough() {
     passthroughSupported_ = false;
     return;
   }
+  applyPassthrough();
+}
+
+void XrApp::applyPassthrough() {
+  if (!passthroughLayer_) return;
+  // The solid room doesn't need the cameras, so stop them.
+  if (settings_.solidRoom != passthroughPaused_ && xrPassthroughPauseFB_ && xrPassthroughStartFB_) {
+    XrResult r = settings_.solidRoom ? xrPassthroughPauseFB_(passthrough_)
+                                     : xrPassthroughStartFB_(passthrough_);
+    if (XR_SUCCEEDED(r)) passthroughPaused_ = settings_.solidRoom;
+  }
 
   // Room dimming fades passthrough towards black; saturation greys it out.
-  if (xrPassthroughLayerSetStyleFB_ &&
-      (settings_.passthroughOpacity < 1.0f || settings_.passthroughSaturation < 1.0f)) {
+  if (xrPassthroughLayerSetStyleFB_) {
     XrPassthroughBrightnessContrastSaturationFB bcs{XR_TYPE_PASSTHROUGH_BRIGHTNESS_CONTRAST_SATURATION_FB};
     bcs.brightness = 0.0f;
     bcs.contrast = 1.0f;
@@ -715,6 +858,7 @@ void XrApp::shutdown() {
 
   scene_.destroy();
   if (videoTexture_) glDeleteTextures(1, &videoTexture_);
+  if (panelTexture_) glDeleteTextures(1, &panelTexture_);
 
   if (display_ != EGL_NO_DISPLAY) {
     eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -752,6 +896,42 @@ void XrApp::pollEvents(bool& quit) {
         break;
     }
     event = {XR_TYPE_EVENT_DATA_BUFFER};
+  }
+}
+
+void XrApp::applyPending() {
+  std::vector<float> settings;
+  std::string model;
+  bool settingsChanged, modelChanged;
+  {
+    std::lock_guard<std::mutex> lock(gPendingMutex);
+    settingsChanged = gSettingsPending;
+    modelChanged = gModelPending;
+    settings.swap(gPendingSettings);
+    model.swap(gPendingModel);
+    gSettingsPending = gModelPending = false;
+  }
+  if (settingsChanged) {
+    settings_.set(settings.data(), static_cast<int>(settings.size()));
+    scene_.setPicture(settings_.scanlines, settings_.scanlineFade, settings_.reflections);
+    scene_.setDarkRoom(settings_.solidRoom);
+    applyPassthrough();
+  }
+  if (modelChanged) {
+    // Keep the picture the same size across models.
+    float inches = crtScale_ * scene_.screenDiagonalInches();
+    scene_.destroy();
+    if (!scene_.init(model.c_str())) {
+      LOGE("scene reload failed");
+      gExitRequested.store(true);
+      return;
+    }
+    scene_.setPicture(settings_.scanlines, settings_.scanlineFade, settings_.reflections);
+    scene_.setDarkRoom(settings_.solidRoom);
+    for (int h = 0; h < 2; ++h) loadHandMesh(h);
+    crtScale_ = std::clamp(inches / scene_.screenDiagonalInches(), 0.3f, 3.0f);
+    bridge_.screenAspect(scene_.screenAspect());
+    bridge_.crtPoseChanged(crtPose_, crtScale_);
   }
 }
 
@@ -866,6 +1046,8 @@ void XrApp::updateInput(XrTime time, float dt) {
   }
 
   for (int h = 0; h < 2; ++h) updateHand(h, dt);
+  applyGrab();
+  for (int target = 0; target < kTargetCount; ++target) syncTouch(target);
 }
 
 void XrApp::locateHand(int h, XrTime time) {
@@ -909,24 +1091,211 @@ void XrApp::locateHand(int h, XrTime time) {
     float gap = length(Vec3{t.x - i.x, t.y - i.y, t.z - i.z});
     hand.pinch = std::clamp(1.0f - (gap - 0.01f) / 0.03f, 0.0f, 1.0f);
   }
+  const XrVector3f& thumb = hand.joints[XR_HAND_JOINT_THUMB_TIP_EXT].pose.position;
+  const XrVector3f& index = hand.joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
+  hand.pinchPose.q = fromXr(hand.joints[XR_HAND_JOINT_PALM_EXT].pose).q;
+  hand.pinchPose.p = Vec3{thumb.x + index.x, thumb.y + index.y, thumb.z + index.z} * 0.5f;
   bool menu = handAimSupported_ && (aim.status & XR_HAND_TRACKING_AIM_MENU_PRESSED_BIT_FB);
   hand.menuGesture = menu && !hand.menuGestureDown;
   hand.menuGestureDown = menu;
 }
 
-void XrApp::startGrab(int h) {
+void XrApp::startGrab(int h, bool direct, Vec3 at) {
   Hand& hand = hands_[h];
   hand.grabbing = true;
+  hand.directGrab = direct;
   hand.pressedButton = -1;
-  hand.grabOffset = inverse(hand.aim) * crtPose_;
+  hand.touching = false;
+  hand.grabOffset = inverse(hand.hold) * crtPose_;
   hand.grabYaw = 0;
+  hand.anchor = transformPoint(inverse(crtPose_), at) * (1.0f / crtScale_);
+  if (hands_[1 - h].grabbing) {
+    resizing_ = true;
+    resizeDist0_ = std::max(length(hands_[1].hold.p - hands_[0].hold.p), 0.05f);
+    resizeScale0_ = crtScale_;
+    resizeOffset_ = inverse(resizeFrame()) * crtPose_;
+  }
   haptic(h, 0.5f);
 }
 
 void XrApp::endGrab(int h) {
   hands_[h].grabbing = false;
   haptic(h, 0.25f);
+  if (resizing_) {
+    // The other hand carries on holding from where the set is now.
+    resizing_ = false;
+    Hand& other = hands_[1 - h];
+    other.grabOffset = inverse(other.hold) * crtPose_;
+    other.grabYaw = 0;
+    return;
+  }
   bridge_.crtPoseChanged(crtPose_, crtScale_);
+}
+
+// Midpoint of the hands, facing across them.
+Pose XrApp::resizeFrame() {
+  Vec3 a = hands_[0].hold.p, b = hands_[1].hold.p;
+  Vec3 across{b.x - a.x, 0, b.z - a.z};
+  // Hands stacked vertically give no heading; keep the last one.
+  if (length(across) > 0.05f) resizeYaw_ = std::atan2(-across.z, across.x);
+  return {axisAngle({0, 1, 0}, resizeYaw_), (a + b) * 0.5f};
+}
+
+void XrApp::applyGrab() {
+  for (const Hand& hand : hands_) {
+    if (!hand.holdingPanel) continue;
+    Pose panel = hand.hold * hand.panelOffset;
+    panelPose_.p = panel.p;
+    panelPose_.q = axisAngle({0, 1, 0}, yawOf(panel.q));
+  }
+
+  Pose held;
+  if (resizing_) {
+    float spacing = length(hands_[1].hold.p - hands_[0].hold.p);
+    crtScale_ = std::clamp(resizeScale0_ * spacing / resizeDist0_, 0.3f, 3.0f);
+    held = resizeFrame() * resizeOffset_;
+  } else {
+    const Hand* holder = hands_[0].grabbing ? &hands_[0] : hands_[1].grabbing ? &hands_[1] : nullptr;
+    if (!holder) return;
+    held = holder->hold * holder->grabOffset;
+    held.q = axisAngle({0, 1, 0}, holder->grabYaw) * held.q;
+  }
+  // Keep the set upright; only its heading follows the hands.
+  crtPose_.p = held.p;
+  crtPose_.q = axisAngle({0, 1, 0}, yawOf(held.q));
+}
+
+void XrApp::syncTouch(int target) {
+  TouchState& state = touches_[target];
+  auto send = [&](bool down) {
+    if (target == kTargetPicture) {
+      bridge_.touch(state.u, state.v, down);
+    } else {
+      panelCommand(bridge_.panelTouch(state.u, state.v, down));
+    }
+  };
+  auto touchingHere = [&](int h) { return hands_[h].touching && hands_[h].touchTarget == target; };
+  int previous = state.hand;
+  if (state.hand >= 0 && !touchingHere(state.hand)) {
+    send(false);
+    state.hand = -1;
+  }
+  for (int h = 0; h < 2 && state.hand < 0; ++h) {
+    if (touchingHere(h)) state.hand = h;
+  }
+  if (state.hand < 0) return;
+  const Hand& hand = hands_[state.hand];
+  if (state.hand != previous || hand.touchU != state.u || hand.touchV != state.v) {
+    state.u = hand.touchU;
+    state.v = hand.touchV;
+    send(true);
+  }
+}
+
+// Fingertip touches: pushing through the target's plane touches it, if the tip came from in front.
+void XrApp::pokeTouch(Hand& hand, int target, bool over, float u, float v, float into) {
+  if (hand.touching && (!hand.pokeTouch || hand.touchTarget != target)) hand.touching = false;
+  if (hand.armedTarget != target) hand.armedTarget = -1;
+  if (hand.touching) {
+    hand.touching = over && into > -0.005f;
+  } else if (over && into > 0 && hand.armedTarget == target) {
+    hand.touching = hand.pokeTouch = true;
+    hand.touchTarget = target;
+  }
+  if (!over) {
+    hand.armedTarget = -1;
+  } else if (into < -0.002f) {
+    hand.armedTarget = target;
+  }
+  if (hand.touching) {
+    hand.touchU = u;
+    hand.touchV = v;
+  }
+}
+
+void XrApp::closePanel() {
+  panelOpen_ = false;
+  for (Hand& hand : hands_) hand.holdingPanel = false;
+}
+
+void XrApp::togglePanel() {
+  if (panelOpen_) {
+    closePanel();
+    return;
+  }
+  panelOpen_ = true;
+  if (!haveHead_) return;
+  // Just below eye level, in easy reach, facing the viewer.
+  float yaw = yawOf(head_.q);
+  Vec3 forward{-std::sin(yaw), 0, -std::cos(yaw)};
+  panelPose_.p = head_.p + forward * 0.6f;
+  panelPose_.p.y = head_.p.y - 0.2f;
+  panelPose_.q = axisAngle({0, 1, 0}, yaw);
+}
+
+void XrApp::panelCommand(int command) {
+  if (command == kPanelClose) {
+    closePanel();
+  } else if (command == kPanelRecenter) {
+    // Hands need the set within reach to poke it, where the panel would be in the way.
+    bool handsOnly = !hands_[kLeft].active && !hands_[kRight].active;
+    if (handsOnly) {
+      placeInFront(settings_.reachDistance, 0.25f);
+      closePanel();
+    } else {
+      placeInFront();
+    }
+  } else if (command >= kPanelSizeFirst &&
+             command < kPanelSizeFirst + static_cast<int>(std::size(kSizePresetsInches))) {
+    crtScale_ = kSizePresetsInches[command - kPanelSizeFirst] / scene_.screenDiagonalInches();
+    bridge_.crtPoseChanged(crtPose_, crtScale_);
+  }
+}
+
+bool XrApp::panelAt(Vec3 origin, Vec3 dir, float* u, float* v, float* t) const {
+  if (!panelOpen_) return false;
+  Pose inv = inverse(panelPose_);
+  Vec3 o = transformPoint(inv, origin), d = rotate(inv.q, dir);
+  if (d.z >= -1e-6f) return false;
+  *t = -o.z / d.z;
+  if (*t < 0) return false;
+  float into;
+  return panelUnderPoint(origin + dir * *t, u, v, &into);
+}
+
+bool XrApp::panelUnderPoint(Vec3 point, float* u, float* v, float* into) const {
+  if (!panelOpen_) return false;
+  Vec3 p = transformPoint(inverse(panelPose_), point);
+  *u = p.x / (2 * kPanelHalfW) + 0.5f;
+  *v = 0.5f - p.y / (2 * kPanelHalfH);
+  *into = -p.z;
+  return *u >= 0 && *u <= 1 && *v >= 0 && *v <= 1;
+}
+
+float XrApp::panelDistance(Vec3 point) const {
+  if (!panelOpen_) return 1e9f;
+  Vec3 p = transformPoint(inverse(panelPose_), point);
+  Vec3 out{std::max(std::fabs(p.x) - kPanelHalfW, 0.0f), std::max(std::fabs(p.y) - kPanelHalfH, 0.0f),
+           p.z};
+  return length(out);
+}
+
+// One hand at a time; returns false when the other already has it.
+bool XrApp::startPanelGrab(int h, bool direct, Vec3 at) {
+  if (hands_[1 - h].holdingPanel) return false;
+  Hand& hand = hands_[h];
+  hand.holdingPanel = true;
+  hand.directPanelGrab = direct;
+  hand.touching = false;
+  hand.panelOffset = inverse(hand.hold) * panelPose_;
+  hand.panelAnchor = transformPoint(inverse(panelPose_), at);
+  haptic(h, 0.5f);
+  return true;
+}
+
+void XrApp::endPanelGrab(int h) {
+  hands_[h].holdingPanel = false;
+  haptic(h, 0.25f);
 }
 
 void XrApp::pressButton(int h, int button) {
@@ -952,21 +1321,72 @@ void XrApp::repeatHeldButton(int h, float dt) {
 void XrApp::updateTrackedHand(int h, float dt) {
   Hand& hand = hands_[h];
   Hand& other = hands_[1 - h];
+  bool pinchDown = hand.pinch > 0.85f || (hand.pinchDown && hand.pinch > 0.6f);
+
+  if (hand.grabbing && hand.directGrab) {
+    hand.hold = hand.pinchPose;
+    if (!pinchDown) endGrab(h);
+    hand.pinchDown = pinchDown;
+    return;
+  }
+  if (hand.holdingPanel) {
+    hand.hold = hand.pinchPose;
+    if (!pinchDown) endPanelGrab(h);
+    hand.pinchDown = pinchDown;
+    return;
+  }
 
   // Poke: the index fingertip presses the set's buttons directly.
   const XrHandJointLocationEXT& tipJoint = hand.joints[XR_HAND_JOINT_INDEX_TIP_EXT];
   bool tipValid = tipJoint.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT;
   Vec3 tip{tipJoint.pose.position.x, tipJoint.pose.position.y, tipJoint.pose.position.z};
+
+  // The settings panel, when open, takes pokes from just in front of it.
+  float pu = 0, pv = 0, pInto = 0;
+  hand.nearPanel = !hand.grabbing && tipValid && panelUnderPoint(tip, &pu, &pv, &pInto) &&
+                   pInto > -0.08f && pInto < 0.05f;
+  if (hand.nearPanel) {
+    hand.nearSet = false;
+    if (hand.pokeButton >= 0) hand.pokeButton = hand.pressedButton = -1;
+    if (hand.pinchDown && hand.pressedButton >= 0) hand.pressedButton = -1;
+    hand.pinchOnSet = false;
+    bool pinchStarted = pinchDown && !hand.pinchDown;
+    hand.pinchDown = pinchDown;
+    // A pinch at the panel, rather than a poke, picks it up.
+    if (pinchStarted && !hand.touching && panelDistance(hand.pinchPose.p) < kGrabReach) {
+      hand.hold = hand.pinchPose;
+      if (startPanelGrab(h, true, hand.pinchPose.p)) return;
+    }
+    pokeTouch(hand, kTargetPanel, true, pu, pv, pInto);
+    return;
+  }
+
   hand.nearSet = !hand.grabbing && tipValid && scene_.nearFront(crtPose_, crtScale_, tip, 0.12f);
 
   if (hand.nearSet) {
     // Leaving laser mode mid-pinch shouldn't leave a pending tap or held button behind.
     if (hand.pinchDown && hand.pressedButton >= 0 && hand.pokeButton < 0) hand.pressedButton = -1;
-    hand.pinchDown = hand.pinchOnSet = false;
+    hand.pinchOnSet = false;
 
     float depth = 0;
     int b = scene_.buttonUnderPoint(crtPose_, crtScale_, tip, &depth);
     if (b >= 0 && depth > -0.03f) hand.hoverButton = b;
+
+    // Pinching the set itself, away from the buttons, picks it up.
+    bool pinchStarted = pinchDown && !hand.pinchDown;
+    hand.pinchDown = pinchDown;
+    if (pinchStarted && hand.pokeButton < 0 && hand.hoverButton < 0 &&
+        scene_.distanceTo(crtPose_, crtScale_, hand.pinchPose.p) < kGrabReach) {
+      hand.hold = hand.pinchPose;
+      startGrab(h, true, hand.pinchPose.p);
+      return;
+    }
+
+    float u = 0, v = 0, into = 0;
+    bool overPicture =
+        bridge_.canTouch() && scene_.pictureUnderPoint(crtPose_, crtScale_, tip, &u, &v, &into);
+    pokeTouch(hand, kTargetPicture, overPicture, u, v, into);
+
     if (hand.pokeButton >= 0) {
       // Release once the finger backs off the face or slides off the button.
       if (b != hand.pokeButton || depth < -0.004f) {
@@ -993,27 +1413,51 @@ void XrApp::updateTrackedHand(int h, float dt) {
     hand.pressedButton = -1;
   }
   hand.pokeArmed = false;
+  hand.armedTarget = -1;
+  if (hand.touching && hand.pokeTouch) hand.touching = false;
 
-  // Within arm's reach, so the buttons can be poked.
-  if (hand.menuGesture) placeInFront(settings_.reachDistance, 0.25f);
+  if (hand.menuGesture) {
+    if (bridge_.hasPanel()) {
+      togglePanel();
+    } else {
+      // Within arm's reach, so the buttons can be poked.
+      placeInFront(settings_.reachDistance, 0.25f);
+    }
+  }
 
   // Laser: pinch acts like the trigger, and a held pinch on the set grabs it.
   if (!hand.aimValid) {
     if (hand.grabbing) endGrab(h);
-    hand.pinchDown = hand.pinchOnSet = false;
+    hand.pinchDown = hand.pinchOnSet = hand.touching = false;
     hand.pressedButton = -1;
     return;
   }
+  hand.hold = hand.aim;
   Vec3 origin = hand.aim.p;
   Vec3 dir = rotate(hand.aim.q, {0, 0, -1});
   float hit = scene_.rayHit(crtPose_, crtScale_, origin, dir);
   bool pointing = hit >= 0.0f && hit < 20.0f;
+  float pt = 0;
+  bool onPanel = !hand.grabbing && panelAt(origin, dir, &pu, &pv, &pt) && !(pointing && hit < pt);
+  if (onPanel) pointing = false;
   if (pointing && !hand.grabbing) hand.hoverButton = scene_.buttonAt(crtPose_, crtScale_, origin, dir);
+  float u = 0, v = 0, t = 0;
+  bool onPicture = pointing && !hand.grabbing && hand.hoverButton < 0 && bridge_.canTouch() &&
+                   scene_.pictureAt(crtPose_, crtScale_, origin, dir, &u, &v, &t);
 
-  bool pinchDown = hand.pinch > 0.85f || (hand.pinchDown && hand.pinch > 0.6f);
   if (pinchDown && !hand.pinchDown) {
-    if (hand.hoverButton >= 0) {
+    if (onPanel) {
+      hand.touching = true;
+      hand.pokeTouch = false;
+      hand.touchTarget = kTargetPanel;
+    } else if (other.grabbing && pointing) {
+      startGrab(h, false, origin + dir * hit);
+    } else if (hand.hoverButton >= 0) {
       pressButton(h, hand.hoverButton);
+    } else if (onPicture) {
+      hand.touching = true;
+      hand.pokeTouch = false;
+      hand.touchTarget = kTargetPicture;
     } else if (pointing) {
       hand.pinchOnSet = true;
       hand.pinchHeld = 0;
@@ -1021,9 +1465,11 @@ void XrApp::updateTrackedHand(int h, float dt) {
     }
   } else if (pinchDown) {
     if (hand.pressedButton >= 0) repeatHeldButton(h, dt);
-    if (hand.pinchOnSet && !hand.grabbing && !other.grabbing) {
+    if (hand.pinchOnSet && !hand.grabbing) {
       hand.pinchHeld += dt;
-      if (hand.pinchHeld > 0.35f || length(origin - hand.pinchStart) > 0.03f) startGrab(h);
+      if (hand.pinchHeld > 0.35f || length(origin - hand.pinchStart) > 0.03f) {
+        startGrab(h, false, origin + dir * hit);
+      }
     }
   } else if (hand.pinchDown) {
     if (hand.grabbing) {
@@ -1033,14 +1479,10 @@ void XrApp::updateTrackedHand(int h, float dt) {
     }
     hand.pinchOnSet = false;
     hand.pressedButton = -1;
+    hand.touching = false;
   }
   hand.pinchDown = pinchDown;
-
-  if (hand.grabbing) {
-    Pose held = hand.aim * hand.grabOffset;
-    crtPose_.p = held.p;
-    crtPose_.q = axisAngle({0, 1, 0}, yawOf(held.q));
-  }
+  updateLaserTouch(hand, onPicture, u, v, onPanel, pu, pv);
 }
 
 int XrApp::collectOccluders(int h, float* spheres, int max) const {
@@ -1099,45 +1541,64 @@ int XrApp::collectOccluders(int h, float* spheres, int max) const {
 
 void XrApp::updateHand(int h, float dt) {
   Hand& hand = hands_[h];
-  Hand& other = hands_[1 - h];
   hand.hoverButton = -1;
   if (!hand.active) {
+    // A controller put down mid-grab or mid-touch lets go rather than handing over to the hand.
+    if (hand.squeezeDown) {
+      hand.squeezeDown = false;
+      if (hand.grabbing) endGrab(h);
+      if (hand.holdingPanel) endPanelGrab(h);
+    }
+    if (hand.triggerDown) hand.triggerDown = hand.touching = false;
     if (hand.tracked) {
       updateTrackedHand(h, dt);
       return;
     }
     hand.pressedButton = -1;
     hand.pokeButton = -1;
-    hand.pinchDown = hand.pinchOnSet = false;
-    if (hand.grabbing) {
-      hand.grabbing = false;
-      bridge_.crtPoseChanged(crtPose_, crtScale_);
-    }
+    hand.pinchDown = hand.pinchOnSet = hand.touching = false;
+    if (hand.grabbing) endGrab(h);
+    if (hand.holdingPanel) endPanelGrab(h);
     return;
   }
 
+  hand.nearSet = hand.nearPanel = false;
+  if (hand.trigger > 0.7f || hand.squeeze > 0.6f || hand.primaryPressed || hand.secondaryPressed) {
+    remoteHand_ = h;
+  }
+  hand.hold = hand.aim;
   Vec3 origin = hand.aim.p;
   Vec3 dir = rotate(hand.aim.q, {0, 0, -1});
   float hit = scene_.rayHit(crtPose_, crtScale_, origin, dir);
   bool pointing = hit >= 0.0f && hit < 20.0f;
+  bool inReach = scene_.distanceTo(crtPose_, crtScale_, origin) < kGrabReach;
+  // The panel wins where it's in front of the set.
+  float pu = 0, pv = 0, pt = 0;
+  bool onPanel = panelAt(origin, dir, &pu, &pv, &pt) && !(pointing && hit < pt);
+  bool panelInReach = panelDistance(origin) < kGrabReach;
+  if (onPanel || panelInReach) pointing = inReach = false;
 
-  // Grab start / end with hysteresis.
-  if (!hand.grabbing && !other.grabbing && pointing && hand.squeeze > 0.6f) {
-    hand.grabbing = true;
-    hand.pressedButton = -1;
-    hand.grabOffset = inverse(hand.aim) * crtPose_;
-    hand.grabYaw = 0;
-    haptic(h, 0.5f);
-  } else if (hand.grabbing && hand.squeeze < 0.4f) {
-    hand.grabbing = false;
-    haptic(h, 0.25f);
-    bridge_.crtPoseChanged(crtPose_, crtScale_);
+  // Grab on squeeze, directly when within reach, otherwise along the ray. The panel comes first.
+  bool squeezeDown = hand.squeeze > 0.6f || (hand.squeezeDown && hand.squeeze > 0.4f);
+  bool squeezed = squeezeDown && !hand.squeezeDown && !hand.grabbing && !hand.holdingPanel;
+  if (squeezed && (onPanel || panelInReach)) {
+    startPanelGrab(h, panelInReach, panelInReach ? origin : origin + dir * pt);
+  } else if (squeezed && (inReach || pointing)) {
+    startGrab(h, inReach, inReach ? origin : origin + dir * hit);
+  } else if (!squeezeDown && hand.grabbing) {
+    endGrab(h);
+  } else if (!squeezeDown && hand.holdingPanel) {
+    endPanelGrab(h);
   }
+  hand.squeezeDown = squeezeDown;
+  if (hand.holdingPanel) return;
 
   if (hand.grabbing) {
+    // Two hands on the set resize it instead.
+    if (resizing_) return;
     // Thumbstick Y pushes the set away or pulls it in along the ray; X spins it.
     // The controller looks down -Z, so a more negative offset is further away.
-    if (std::fabs(hand.stick.y) > 0.15f) {
+    if (!hand.directGrab && std::fabs(hand.stick.y) > 0.15f) {
       hand.grabOffset.p.z = std::min(hand.grabOffset.p.z - hand.stick.y * dt * 1.5f, -0.3f);
     }
     if (std::fabs(hand.stick.x) > 0.15f) hand.grabYaw -= hand.stick.x * dt * 2.0f;
@@ -1154,22 +1615,30 @@ void XrApp::updateHand(int h, float dt) {
       crtScale_ = next / modelInches;
       haptic(h, 0.35f);
     }
-    Pose held = hand.aim * hand.grabOffset;
-    // Keep the set upright; only its heading follows the controller.
-    crtPose_.p = held.p;
-    crtPose_.q = axisAngle({0, 1, 0}, yawOf(held.q) + hand.grabYaw);
     return;
   }
 
-  // Trigger presses front-panel buttons; anywhere else on the set toggles playback.
+  // Trigger presses front-panel buttons, touches the picture when that's passed on, and anywhere
+  // else on the set toggles playback.
   if (pointing) hand.hoverButton = scene_.buttonAt(crtPose_, crtScale_, origin, dir);
+  float u = 0, v = 0, t = 0;
+  bool onPicture = pointing && hand.hoverButton < 0 && bridge_.canTouch() &&
+                   scene_.pictureAt(crtPose_, crtScale_, origin, dir, &u, &v, &t);
   bool triggerDown = hand.trigger > 0.7f || (hand.triggerDown && hand.trigger > 0.5f);
   if (triggerDown && !hand.triggerDown) {
-    if (hand.hoverButton >= 0) {
+    if (onPanel) {
+      hand.touching = true;
+      hand.pokeTouch = false;
+      hand.touchTarget = kTargetPanel;
+    } else if (hand.hoverButton >= 0) {
       hand.pressedButton = hand.hoverButton;
       hand.buttonRepeat = 0.45f;
       haptic(h, 0.3f);
       bridge_.action(scene_.button(hand.pressedButton).action);
+    } else if (onPicture) {
+      hand.touching = true;
+      hand.pokeTouch = false;
+      hand.touchTarget = kTargetPicture;
     } else if (pointing) {
       bridge_.action(kTogglePause);
     }
@@ -1185,12 +1654,20 @@ void XrApp::updateHand(int h, float dt) {
     }
   } else if (!triggerDown) {
     hand.pressedButton = -1;
+    hand.touching = false;
   }
   hand.triggerDown = triggerDown;
+  updateLaserTouch(hand, onPicture, u, v, onPanel, pu, pv);
 
   if (hand.primaryPressed) bridge_.action(h == kRight ? kTogglePause : kCycleAudio);
   if (hand.secondaryPressed) bridge_.action(h == kRight ? kShowProgress : kCycleSubtitles);
-  if (hand.menuPressed) bridge_.action(kExit);
+  if (hand.menuPressed) {
+    if (bridge_.hasPanel()) {
+      togglePanel();
+    } else {
+      bridge_.action(kExit);
+    }
+  }
   if (hand.stickClickPressed) placeInFront();
 
   // Thumbstick flicks repeat while held. X seeks 10 s on either hand; Y seeks 5 min on the right
@@ -1242,32 +1719,88 @@ void XrApp::renderEye(int eyeIndex, const XrView& view, uint32_t imageIndex) {
   glDisable(GL_CULL_FACE);
   glDisable(GL_BLEND);
   // Transparent where nothing is drawn so passthrough shows through.
-  glClearColor(0, 0, 0, passthroughLayer_ ? 0.0f : 1.0f);
+  glClearColor(0, 0, 0, showPassthrough() ? 0.0f : 1.0f);
   glClearDepthf(1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   Pose eyePose = fromXr(view.pose);
   Mat4 viewProj = Mat4::projection(view.fov, 0.05f, 100.0f) * Mat4::fromPose(inverse(eyePose));
+  bool solid = !showPassthrough();
+  if (settings_.solidRoom) scene_.drawRoom(viewProj, eyePose.p, floorY_);
 
+  // Without passthrough the real controllers can't be seen, so both get a remote.
+  int remote = hands_[remoteHand_].active ? remoteHand_ : 1 - remoteHand_;
   ControllerVisual visuals[2];
   for (int h = 0; h < 2; ++h) {
     const Hand& hand = hands_[h];
     // Tracked hands get a laser but no controller model, and no laser while poking.
-    bool laser = hand.active || (hand.tracked && hand.aimValid && !hand.nearSet);
-    visuals[h].active = laser;
-    visuals[h].drawController = hand.active;
+    bool laser = hand.active || (hand.tracked && hand.aimValid && !hand.nearSet && !hand.nearPanel);
+    visuals[h].active = laser || hand.grabbing || hand.holdingPanel;
+    visuals[h].drawController = hand.active && (h == remote || solid);
     visuals[h].aim = hand.aim;
+    visuals[h].grabbing = hand.grabbing;
+    visuals[h].directGrab = hand.directGrab;
+    visuals[h].anchor = transformPoint(crtPose_, hand.anchor * crtScale_);
+    if (hand.holdingPanel) {
+      visuals[h].grabbing = true;
+      visuals[h].directGrab = hand.directPanelGrab;
+      visuals[h].anchor = transformPoint(panelPose_, hand.panelAnchor);
+    }
+    if (hand.nearSet && bridge_.canTouch()) {
+      // Mark the spot under the fingertip, shrinking as it closes in.
+      const XrVector3f& t = hand.joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
+      Vec3 tip{t.x, t.y, t.z};
+      float u, v, into;
+      if (scene_.pictureUnderPoint(crtPose_, crtScale_, tip, &u, &v, &into) && into > -0.05f) {
+        visuals[h].active = true;
+        visuals[h].tipDot = true;
+        visuals[h].tipDotAt = tip + rotate(crtPose_.q, {0, 0, 1}) * into;
+        visuals[h].tipDotSize = 0.003f + 0.08f * std::max(-into, 0.0f);
+        visuals[h].tipTouching = hand.touching && hand.pokeTouch;
+      }
+    }
+    if (hand.nearPanel) {
+      const XrVector3f& t = hand.joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
+      Vec3 tip{t.x, t.y, t.z};
+      float u, v, into;
+      if (panelUnderPoint(tip, &u, &v, &into) && into > -0.05f) {
+        visuals[h].active = true;
+        visuals[h].tipDot = true;
+        visuals[h].tipDotAt = tip + rotate(panelPose_.q, {0, 0, 1}) * into;
+        visuals[h].tipDotSize = 0.003f + 0.08f * std::max(-into, 0.0f);
+        visuals[h].tipTouching = hand.touching && hand.pokeTouch;
+      }
+    }
     if (laser) {
       Vec3 dir = rotate(hand.aim.q, {0, 0, -1});
       float hit = scene_.rayHit(crtPose_, crtScale_, hand.aim.p, dir);
+      visuals[h].inReach =
+          hand.active && scene_.distanceTo(crtPose_, crtScale_, hand.aim.p) < kGrabReach;
       visuals[h].highlighted = hand.grabbing || (hit >= 0 && hit < 20.0f);
       visuals[h].rayLength = visuals[h].highlighted && hit >= 0 ? hit : 0.6f;
+      // End on the picture itself, with a cursor dot, when it takes touches.
+      float u, v, t;
+      if (bridge_.canTouch() && hit >= 0 && hit < 20.0f &&
+          scene_.pictureAt(crtPose_, crtScale_, hand.aim.p, dir, &u, &v, &t)) {
+        visuals[h].rayLength = t;
+        visuals[h].rayDot = true;
+      }
+      float pt;
+      if (panelAt(hand.aim.p, dir, &u, &v, &pt) && !(hit >= 0 && hit < pt)) {
+        visuals[h].highlighted = true;
+        visuals[h].inReach = false;
+        visuals[h].rayLength = pt;
+        visuals[h].rayDot = true;
+      }
+      if (hand.active && panelDistance(hand.aim.p) < kGrabReach) visuals[h].inReach = true;
     }
   }
 
   scene_.draw(viewProj, eyePose.p, crtPose_, crtScale_, visuals, 2);
+  if (panelOpen_) scene_.drawPanel(viewProj, panelPose_, kPanelHalfW, kPanelHalfH, panelTexture_);
 
-  if (passthroughLayer_) {
+  // Hands cut through to passthrough, or are drawn when it's off.
+  if (passthroughLayer_ || solid) {
     for (int h = 0; h < 2; ++h) {
       const Hand& hand = hands_[h];
       if (!hand.tracked) continue;
@@ -1284,11 +1817,11 @@ void XrApp::renderEye(int eyeIndex, const XrView& view, uint32_t imageIndex) {
         skin[j] = Mat4::fromPose(fromXr(l.pose) * inverse(hand.bindPoses[j]));
       }
       if (skinned) {
-        scene_.drawHandMesh(h, viewProj, skin, settings_.handPadding);
+        scene_.drawHandMesh(h, viewProj, skin, solid ? 0.0f : settings_.handPadding, solid);
       } else {
         float spheres[CrtScene::kMaxOccluders * 4];
         int count = collectOccluders(h, spheres, CrtScene::kMaxOccluders);
-        scene_.drawOccluders(viewProj, spheres, count);
+        scene_.drawOccluders(viewProj, spheres, count, solid);
       }
     }
   }
@@ -1309,7 +1842,9 @@ void XrApp::frame() {
   float dt = lastTime_ ? std::clamp(static_cast<float>(now - lastTime_) * 1e-9f, 0.0f, 0.1f) : 0.0f;
   lastTime_ = now;
 
+  applyPending();
   updateInput(now, dt);
+  if (panelOpen_) bridge_.drawPanel(panelTexture_);
 
   bool hasFrame = bridge_.updateVideo(texMatrix_);
   scene_.setVideo(videoTexture_, texMatrix_, hasFrame);
@@ -1327,7 +1862,7 @@ void XrApp::frame() {
   XrCompositionLayerProjectionView projectionViews[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                          {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
 
-  if (passthroughLayer_) {
+  if (showPassthrough()) {
     passthroughLayer.layerHandle = passthroughLayer_;
     passthroughLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&passthroughLayer));
@@ -1369,7 +1904,7 @@ void XrApp::frame() {
       projection.space = appSpace_;
       projection.viewCount = 2;
       projection.views = projectionViews;
-      if (passthroughLayer_) projection.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+      if (showPassthrough()) projection.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
       layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection));
     }
   }
@@ -1397,6 +1932,7 @@ bool XrApp::run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initi
   }
   initPassthrough();
   scene_.setPicture(settings_.scanlines, settings_.scanlineFade, settings_.reflections);
+  scene_.setDarkRoom(settings_.solidRoom);
   initHandTracking();
 
   if (initialPose && env->GetArrayLength(initialPose) == 8 && stageSpace_) {
@@ -1416,6 +1952,17 @@ bool XrApp::run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initi
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
   // Kotlin wraps the texture in a SurfaceTexture and hands its Surface to mpv.
   bridge_.glReady(videoTexture_, scene_.screenAspect());
+
+  // The app draws the settings panel into this, mipmapped so text stays clean at an angle.
+  glGenTextures(1, &panelTexture_);
+  glBindTexture(GL_TEXTURE_2D, panelTexture_);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  // Stage space has the floor at 0; otherwise guess it below a standing viewer.
+  floorY_ = stageSpace_ ? 0.0f : -1.6f;
 
   bool quit = false;
   while (!quit) {
@@ -1454,6 +2001,10 @@ Java_app_marlboroadvance_mpvex_ui_player_xr_XrNative_run(JNIEnv* env, jclass, jo
                                                          jobject bridge, jfloatArray initialPose,
                                                          jstring modelPath, jfloatArray settings) {
   gExitRequested.store(false);
+  {
+    std::lock_guard<std::mutex> lock(gPendingMutex);
+    gSettingsPending = gModelPending = false;
+  }
   std::string path;
   if (modelPath) {
     const char* chars = env->GetStringUTFChars(modelPath, nullptr);
@@ -1462,6 +2013,30 @@ Java_app_marlboroadvance_mpvex_ui_player_xr_XrNative_run(JNIEnv* env, jclass, jo
   }
   XrApp app;
   return app.run(env, activity, bridge, initialPose, path.c_str(), settings) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_app_marlboroadvance_mpvex_ui_player_xr_XrNative_setSettings(JNIEnv* env, jclass,
+                                                                jfloatArray settings) {
+  if (!settings) return;
+  std::vector<float> v(env->GetArrayLength(settings));
+  env->GetFloatArrayRegion(settings, 0, static_cast<jsize>(v.size()), v.data());
+  std::lock_guard<std::mutex> lock(gPendingMutex);
+  gPendingSettings.swap(v);
+  gSettingsPending = true;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_app_marlboroadvance_mpvex_ui_player_xr_XrNative_setModel(JNIEnv* env, jclass, jstring modelPath) {
+  std::string path;
+  if (modelPath) {
+    const char* chars = env->GetStringUTFChars(modelPath, nullptr);
+    path = chars;
+    env->ReleaseStringUTFChars(modelPath, chars);
+  }
+  std::lock_guard<std::mutex> lock(gPendingMutex);
+  gPendingModel = path;
+  gModelPending = true;
 }
 
 extern "C" JNIEXPORT void JNICALL

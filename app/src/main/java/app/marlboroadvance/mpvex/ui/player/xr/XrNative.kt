@@ -26,6 +26,15 @@ interface XrBridge {
 
   /** The session is over; release anything tied to the GL context before it is destroyed. */
   fun onSessionEnded()
+
+  /** Redraw the settings panel into [texture] (GL_TEXTURE_2D) if it changed. */
+  fun updatePanel(texture: Int): Boolean
+
+  /** A touch on the settings panel, 0..1 from its top left. Returns an [XrPanel] CMD_ code. */
+  fun onPanelTouch(x: Float, y: Float, down: Boolean): Int
+
+  /** The TV model changed, and with it the glass's width / height. */
+  fun onScreenAspect(screenAspect: Float)
 }
 
 object XrNative {
@@ -52,4 +61,12 @@ object XrNative {
   /** Asks the running session to exit; [run] returns shortly after. */
   @JvmStatic
   external fun requestExit()
+
+  /** New settings, in the same order as [run] takes them; applied on the next frame. */
+  @JvmStatic
+  external fun setSettings(settings: FloatArray)
+
+  /** Switches TV model; null for the built-in one. */
+  @JvmStatic
+  external fun setModel(modelPath: String?)
 }
