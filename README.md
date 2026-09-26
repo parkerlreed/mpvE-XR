@@ -34,8 +34,11 @@ headset switches to the immersive CRT player.
    *Settings → VR (Quest) → Play on a virtual CRT*.
 
 *Settings → VR (Quest)* also has the video resolution, a custom-model toggle, reset TV position,
-scanline and glass-reflection strength, room dimming and colour, hand occlusion padding, the
-menu-gesture distance, and the short/long seek lengths.
+scanline and glass-reflection strength, surroundings (passthrough or a dark room), room dimming and
+colour, hand occlusion padding, the hand reach distance, and the short/long seek lengths. Most of
+these are also in the headset: press the left **menu** button (or make the left-hand menu gesture)
+for a settings panel that applies changes straight away, with TV size presets and recenter. Grab
+the panel to move it out of the way.
 
 ## Optional: realistic TV model
 
@@ -57,7 +60,8 @@ have to download it yourself:
    ```
    (For debug builds, use `io.github.parkerlreed.mpvexr.debug` in both paths.)
 
-The next video you open uses the model. Delete `tv.glb` to go back to the built-in TV/VCR.
+The next video you open uses the model. Switch between it and the built-in TV/VCR from the
+headset settings panel, or delete `tv.glb`.
 `adb logcat -s mpvEx-XR` reports whether it loaded.
 
 Any `.glb` with a mesh (or material) named like `screen` will load. The front-panel button
@@ -67,7 +71,8 @@ mapping below is specific to this model.
 
 | Input | Action |
 |---|---|
-| Point at the TV + **grip** | Grab it (it stays upright) |
+| Point at the TV, or touch it with the remote, + **grip** | Grab it (it stays upright) |
+| Grab with both controllers, pull apart / together | Resize it |
 | While grabbing: stick up/down, left/right | Push away / pull in, spin |
 | While grabbing: stick click | Cycle size: 14, 20, 27, 32, 40" |
 | Left stick click | Bring the TV back in front of you |
@@ -77,7 +82,7 @@ mapping below is specific to this model.
 | Stick left/right | Seek ±10 s (hold to repeat) |
 | Right stick up/down | Seek ±5 min (hold to repeat) |
 | Left stick up/down | Volume |
-| Left **menu** button | Back to the browser |
+| Left **menu** button | Headset settings panel |
 
 ### Hand tracking
 
@@ -87,10 +92,11 @@ real hands stay visible in front of the TV.
 | Gesture | Action |
 |---|---|
 | Quick pinch while pointing at the TV | Play / pause |
-| Pinch and hold (or pinch and move) on the TV | Grab it; let go to drop it |
+| Pinch and hold (or pinch and move) on the TV, or pinch it up close | Grab it; let go to drop it |
+| Grab with both hands, pull apart / together | Resize it |
 | Pinch on a button | Press it |
 | Poke a button with your index finger | Press it (reach within ~12 cm of the set) |
-| Left palm-up menu gesture | Bring the TV within arm's reach in front of you |
+| Left palm-up menu gesture | Headset settings panel |
 
 Point at a button on the set and pull the trigger (or pinch, or poke it) to press it:
 
