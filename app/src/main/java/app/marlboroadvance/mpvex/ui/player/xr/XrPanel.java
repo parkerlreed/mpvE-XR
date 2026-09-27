@@ -29,7 +29,7 @@ final class XrPanel
 
   /* The renderer shows the panel at 3:4. */
   static final int WIDTH = 720;
-  static final int HEIGHT = 960;
+  static final int HEIGHT = 1040;
 
   private static final int PAD = 32;
   private static final int HEADER = 112;

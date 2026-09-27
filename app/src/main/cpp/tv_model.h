@@ -37,6 +37,9 @@ class TvModel {
     float threshold = 0;         // linear luminance separating mask from picture
     GLuint occlusion = 0;        // soft edge / corner falloff multiplied into the picture
     float occlusionStrength = 0;
+    // The lit opening inside the painted surround, as x0, y0, x1, y1 across the glass (0..1,
+    // (0, 0) bottom-left). Overscan is measured against it.
+    float picture[4] = {0, 0, 1, 1};
   };
   const ScreenMask& screenMask() const { return mask_; }
 

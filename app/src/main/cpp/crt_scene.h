@@ -69,6 +69,8 @@ class CrtScene {
   }
   // Dims what the glass reflects, to suit the dark room.
   void setDarkRoom(bool dark) { darkRoom_ = dark; }
+  // Share of the picture cropped away under the surround, like a tube's overscan (0..0.5).
+  void setOverscan(float overscan) { overscan_ = overscan; }
   // Bit i set means button i is hovered / held.
   void setButtonState(uint32_t hovered, uint32_t pressed) {
     hoveredButtons_ = hovered;
@@ -145,6 +147,7 @@ class CrtScene {
   bool scanlineFade_ = true;
   float reflections_ = 1.0f;
   bool darkRoom_ = false;
+  float overscan_ = 0.08f;
   uint32_t hoveredButtons_ = 0, pressedButtons_ = 0;
 
   void drawProcedural(const Mat4& model, const Mat4& viewProj, Vec3 eye);

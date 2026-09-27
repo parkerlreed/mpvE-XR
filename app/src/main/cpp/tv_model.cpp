@@ -465,15 +465,37 @@ bool TvModel::load(const char* path) {
         lo = std::min(lo, l);
         hi = std::max(hi, l);
       }
-    stbi_image_free(px);
     if (hi - lo >= 12) {
+      int t = (lo + hi) / 2;
       // The mask is sampled from the sRGB base texture, so compare in linear.
-      mask_.threshold = std::pow((lo + hi) * 0.5f / 255.0f, 2.2f);
+      mask_.threshold = std::pow(t / 255.0f, 2.2f);
       mask_.texture = texture(tex, true, white_);
+      int bx0 = x1, bx1 = x0, by0 = y1, by1 = y0;
+      for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x) {
+          const stbi_uc* q = &px[(y * w + x) * 4];
+          if ((q[0] + q[1] + q[2]) / 3 > t) {
+            bx0 = std::min(bx0, x); bx1 = std::max(bx1, x);
+            by0 = std::min(by0, y); by1 = std::max(by1, y);
+          }
+        }
+      if (bx1 > bx0 && by1 > by0) {
+        // Into the same across-the-glass space the shader maps the video in.
+        auto gx = [&](float u) { float g = (u - uMin) / (uMax - uMin); return mask_.flipU ? 1 - g : g; };
+        auto gy = [&](float v) { float g = (v - vMin) / (vMax - vMin); return mask_.flipV ? 1 - g : g; };
+        float ax = gx(static_cast<float>(bx0) / w), bx = gx(static_cast<float>(bx1 + 1) / w);
+        float ay = gy(static_cast<float>(by0) / h), by = gy(static_cast<float>(by1 + 1) / h);
+        mask_.picture[0] = std::min(ax, bx);
+        mask_.picture[1] = std::min(ay, by);
+        mask_.picture[2] = std::max(ax, bx);
+        mask_.picture[3] = std::max(ay, by);
+      }
     }
-    LOGI("screen: glass uv (%.3f,%.3f)-(%.3f,%.3f), flip %d/%d, mask %s, occlusion %s", uMin, vMin,
-         uMax, vMax, mask_.flipU, mask_.flipV, mask_.texture ? "yes" : "no",
-         mask_.occlusion ? "yes" : "no");
+    stbi_image_free(px);
+    LOGI("screen: glass uv (%.3f,%.3f)-(%.3f,%.3f), picture (%.3f,%.3f)-(%.3f,%.3f), flip %d/%d, "
+         "mask %s, occlusion %s", uMin, vMin, uMax, vMax, mask_.picture[0], mask_.picture[1],
+         mask_.picture[2], mask_.picture[3], mask_.flipU, mask_.flipV,
+         mask_.texture ? "yes" : "no", mask_.occlusion ? "yes" : "no");
     break;
   }
 

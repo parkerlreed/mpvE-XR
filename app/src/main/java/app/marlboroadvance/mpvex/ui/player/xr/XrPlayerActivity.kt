@@ -101,6 +101,7 @@ class XrPlayerActivity : ComponentActivity() {
   private lateinit var scanlines: XrPanel.Row
   private lateinit var scanlineFade: XrPanel.Row
   private lateinit var reflections: XrPanel.Row
+  private lateinit var overscan: XrPanel.Row
   private lateinit var reach: XrPanel.Row
   private lateinit var customModel: XrPanel.Row
 
@@ -527,6 +528,8 @@ class XrPlayerActivity : ComponentActivity() {
       .apply { value = p.scanlinesFadeWithDistance.get().toInt() }
     reflections = XrPanel.slider(getString(R.string.pref_vr_glass_reflections), 0, 100, 5, "%")
       .apply { value = p.glassReflections.get() }
+    overscan = XrPanel.slider(getString(R.string.pref_vr_overscan), 0, 15, 1, "%")
+      .apply { value = p.overscan.get() }
     reach = XrPanel.slider(getString(R.string.pref_vr_reach_distance), 40, 100, 5, " cm")
       .apply { value = p.reachDistanceCm.get() }
     customModel = XrPanel.toggle(getString(R.string.xr_panel_custom_model, XrSupport.MODEL_FILE_NAME))
@@ -534,7 +537,7 @@ class XrPlayerActivity : ComponentActivity() {
     panel = XrPanel(
       getString(R.string.xr_panel_title),
       ::onPanelSettingChanged,
-      surroundings, dimming, saturation, padding, scanlines, scanlineFade, reflections, reach,
+      surroundings, dimming, saturation, padding, scanlines, scanlineFade, reflections, overscan, reach,
       customModel,
       XrPanel.commands(
         getString(R.string.xr_panel_tv_size), XrPanel.CMD_SIZE_FIRST,
@@ -563,6 +566,7 @@ class XrPlayerActivity : ComponentActivity() {
     p.scanlines.set(scanlines.value)
     p.scanlinesFadeWithDistance.set(scanlineFade.on())
     p.glassReflections.set(reflections.value)
+    p.overscan.set(overscan.value)
     p.reachDistanceCm.set(reach.value)
     p.useCustomModel.set(customModel.on())
     updatePanelEnabled()
@@ -580,6 +584,7 @@ class XrPlayerActivity : ComponentActivity() {
       xrPreferences.glassReflections.get().coerceIn(0, 100) / 100f,
       xrPreferences.reachDistanceCm.get() / 100f,
       xrPreferences.surroundings.get().toFloat(),
+      xrPreferences.overscan.get().coerceIn(0, 30) / 100f,
     )
 
   companion object {

@@ -147,6 +147,7 @@
   <string name="pref_vr_scanlines_fade">Fade scanlines with distance</string>
   <string name="pref_vr_scanlines_fade_summary">Hide scanlines once they\'re finer than the headset can show, instead of letting them shimmer</string>
   <string name="pref_vr_glass_reflections">Glass reflections</string>
+  <string name="pref_vr_overscan">Overscan</string>
   <string name="pref_vr_surroundings">Surroundings</string>
   <string name="pref_vr_surroundings_passthrough">Passthrough</string>
   <string name="pref_vr_surroundings_dark_room">Dark room</string>

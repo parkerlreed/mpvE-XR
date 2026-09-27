@@ -15,6 +15,8 @@ class XrPreferences(
   val scanlines = preferenceStore.getInt("xr_scanlines_percent", 35)
   val scanlinesFadeWithDistance = preferenceStore.getBoolean("xr_scanlines_fade", true)
   val glassReflections = preferenceStore.getInt("xr_glass_reflections_percent", 100)
+  // Share of the picture cropped away under the TV's surround, like a real tube.
+  val overscan = preferenceStore.getInt("xr_overscan_percent", 8)
 
   // 0 passthrough, 1 a dark room with passthrough off.
   val surroundings = preferenceStore.getInt("xr_surroundings", 0)

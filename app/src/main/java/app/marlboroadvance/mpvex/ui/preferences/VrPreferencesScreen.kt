@@ -152,6 +152,10 @@ object VrPreferencesScreen : Screen {
               PreferenceDivider()
 
               PercentSlider(preferences.glassReflections, R.string.pref_vr_glass_reflections, 0..100)
+
+              PreferenceDivider()
+
+              PercentSlider(preferences.overscan, R.string.pref_vr_overscan, 0..15)
             }
           }
 

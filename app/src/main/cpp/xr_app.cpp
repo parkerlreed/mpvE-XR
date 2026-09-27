@@ -58,7 +58,7 @@ constexpr int kLeft = 0, kRight = 1;
 constexpr float kGrabReach = 0.06f;
 
 // Settings panel size; the app draws it at this aspect.
-constexpr float kPanelHalfW = 0.18f, kPanelHalfH = 0.24f;
+constexpr float kPanelHalfW = 0.18f, kPanelHalfH = 0.26f;  // matches XrPanel WIDTH x HEIGHT
 
 enum TouchTarget { kTargetPicture, kTargetPanel, kTargetCount };
 
@@ -72,11 +72,12 @@ struct XrSettings {
   float reflections = 1.0f;
   float reachDistance = 0.6f;        // where recentering with hands puts the set
   bool solidRoom = false;            // a dark room instead of passthrough
+  float overscan = 0.08f;            // share of the picture cropped under the surround
 
   void read(JNIEnv* env, jfloatArray array) {
     if (!array) return;
-    float v[8];
-    jsize n = std::min<jsize>(env->GetArrayLength(array), 8);
+    float v[9];
+    jsize n = std::min<jsize>(env->GetArrayLength(array), 9);
     env->GetFloatArrayRegion(array, 0, n, v);
     set(v, n);
   }
@@ -90,6 +91,7 @@ struct XrSettings {
     if (n > 5) reflections = std::clamp(v[5], 0.0f, 1.0f);
     if (n > 6) reachDistance = std::clamp(v[6], 0.3f, 1.5f);
     if (n > 7) solidRoom = v[7] > 0.5f;
+    if (n > 8) overscan = std::clamp(v[8], 0.0f, 0.3f);
   }
 };
 
@@ -914,6 +916,7 @@ void XrApp::applyPending() {
   if (settingsChanged) {
     settings_.set(settings.data(), static_cast<int>(settings.size()));
     scene_.setPicture(settings_.scanlines, settings_.scanlineFade, settings_.reflections);
+    scene_.setOverscan(settings_.overscan);
     scene_.setDarkRoom(settings_.solidRoom);
     applyPassthrough();
   }
@@ -927,6 +930,7 @@ void XrApp::applyPending() {
       return;
     }
     scene_.setPicture(settings_.scanlines, settings_.scanlineFade, settings_.reflections);
+    scene_.setOverscan(settings_.overscan);
     scene_.setDarkRoom(settings_.solidRoom);
     for (int h = 0; h < 2; ++h) loadHandMesh(h);
     crtScale_ = std::clamp(inches / scene_.screenDiagonalInches(), 0.3f, 3.0f);
@@ -1932,6 +1936,7 @@ bool XrApp::run(JNIEnv* env, jobject activity, jobject bridge, jfloatArray initi
   }
   initPassthrough();
   scene_.setPicture(settings_.scanlines, settings_.scanlineFade, settings_.reflections);
+  scene_.setOverscan(settings_.overscan);
   scene_.setDarkRoom(settings_.solidRoom);
   initHandTracking();
 

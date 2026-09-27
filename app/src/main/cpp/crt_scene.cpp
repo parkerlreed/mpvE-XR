@@ -118,9 +118,12 @@ uniform float uScanlineStrength;
 uniform float uScanlineFade;
 uniform float uReflections;
 uniform float uRoomLight;
-// Glass extent in its UVs (min.xy, max.xy); the video covers all of it.
+// Glass extent in its UVs (min.xy, max.xy).
 uniform vec4 uVideoRect;
 uniform vec2 uVideoFlip;
+// Where the video sits across the glass (0..1, bottom-left origin): the picture area grown by
+// the overscan, so its edges fall under the surround.
+uniform vec4 uCrop;
 uniform float uUseMask;
 uniform sampler2D uMask;
 uniform float uMaskThreshold;
@@ -142,6 +145,7 @@ void main() {
 
   vec2 pic = (vUv - uVideoRect.xy) / (uVideoRect.zw - uVideoRect.xy);
   pic = mix(pic, 1.0 - pic, uVideoFlip);
+  pic = (pic - uCrop.xy) / (uCrop.zw - uCrop.xy);
   vec2 tc = (uTexMatrix * vec4(clamp(pic, 0.0, 1.0), 0.0, 1.0)).xy;
   // mpv writes display-referred sRGB; decode so the sRGB swapchain round-trips it unchanged.
   vec3 video = pow(texture(uTex, tc).rgb, vec3(2.2)) * uHasFrame;
@@ -926,6 +930,13 @@ void CrtScene::draw(const Mat4& viewProj, Vec3 eye, const Pose& crtPose, float c
               mask.uvMax[0], mask.uvMax[1]);
   glUniform2f(glGetUniformLocation(screenProgram_, "uVideoFlip"), mask.flipU ? 1.0f : 0.0f,
               mask.flipV ? 1.0f : 0.0f);
+  {
+    const float* pa = mask.picture;
+    float keep = 1.0f - std::clamp(overscan_, 0.0f, 0.5f);
+    float cx = (pa[0] + pa[2]) * 0.5f, cy = (pa[1] + pa[3]) * 0.5f;
+    float hx = (pa[2] - pa[0]) * 0.5f / keep, hy = (pa[3] - pa[1]) * 0.5f / keep;
+    glUniform4f(glGetUniformLocation(screenProgram_, "uCrop"), cx - hx, cy - hy, cx + hx, cy + hy);
+  }
   glUniform1f(glGetUniformLocation(screenProgram_, "uUseMask"), mask.texture ? 1.0f : 0.0f);
   glUniform1f(glGetUniformLocation(screenProgram_, "uMaskThreshold"), mask.threshold);
   glUniform1f(glGetUniformLocation(screenProgram_, "uOcclusionStrength"),
