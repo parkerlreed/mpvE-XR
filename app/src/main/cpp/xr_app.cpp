@@ -1728,7 +1728,7 @@ void XrApp::renderEye(int eyeIndex, const XrView& view, uint32_t imageIndex) {
   bool solid = !showPassthrough();
   if (settings_.solidRoom) scene_.drawRoom(viewProj, eyePose.p, floorY_);
 
-  // Without passthrough the real controllers can't be seen, so both get a remote.
+  // One remote, in whichever hand was used last, with or without passthrough.
   int remote = hands_[remoteHand_].active ? remoteHand_ : 1 - remoteHand_;
   ControllerVisual visuals[2];
   for (int h = 0; h < 2; ++h) {
@@ -1736,7 +1736,7 @@ void XrApp::renderEye(int eyeIndex, const XrView& view, uint32_t imageIndex) {
     // Tracked hands get a laser but no controller model, and no laser while poking.
     bool laser = hand.active || (hand.tracked && hand.aimValid && !hand.nearSet && !hand.nearPanel);
     visuals[h].active = laser || hand.grabbing || hand.holdingPanel;
-    visuals[h].drawController = hand.active && (h == remote || solid);
+    visuals[h].drawController = hand.active && h == remote;
     visuals[h].aim = hand.aim;
     visuals[h].grabbing = hand.grabbing;
     visuals[h].directGrab = hand.directGrab;
